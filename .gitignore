@@ -1,1 +1,4 @@
 cmd/boxo-migrate/boxo-migrate
+go.work
+go.work.sum
+.DS_Store

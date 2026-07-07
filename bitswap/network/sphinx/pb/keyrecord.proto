@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package sphinx.pb;
+
+option go_package = "github.com/ipfs/boxo/bitswap/network/sphinx/pb";
+
+// KeyRecord is the payload of a signed libp2p Envelope announcing a peer's
+// Sphinx NIKE public key. It is distributed via the /sphinx/keys protocol.
+// It is NOT attached to the libp2p PeerRecord: it is a separate Envelope 
+// type with its own domain and codec, so vanilla peers ignore it and its
+// lifecycle is decoupled from address churn.
+message KeyRecord {
+  // Marshalled peer ID of the key owner. Bound into the signature via the
+  // enclosing Envelope; on consume we check it against the sending peer
+  bytes peer_id = 1;
+
+  // Raw X25519 public key bytes (NIKE scheme key material)
+  bytes public_key = 2;
+
+  // Monotonic sequence number, derived from the creation timestamp in
+  // UNIX nanoseconds. A newer record MUST carry a higher seq
+  uint64 seq = 3;
+
+  // Absolute expiry, UNIX nanoseconds. After this instant the record is
+  // evicted from the key store
+  int64 expiry_unix_nano = 4;
+}
