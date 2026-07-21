@@ -12,9 +12,12 @@ type JobMetrics struct {
 	JobsStarted       atomic.Uint64
 	BranchPacketsSent atomic.Uint64
 	SendFailures      atomic.Uint64
-	// RepliesWon settled their job, RepliesDuplicate missed the job table,
-	// RepliesInvalid were undecodable and dropped only their SURB
-	RepliesWon       atomic.Uint64
+	// RepliesCollected were accepted as a branch's OK answer,
+	// RepliesFailed as its Failed answer; RepliesDuplicate missed the job
+	// table or their already-answered branch; RepliesInvalid were
+	// undecodable and retired their branch without a contribution
+	RepliesCollected atomic.Uint64
+	RepliesFailed    atomic.Uint64
 	RepliesDuplicate atomic.Uint64
 	RepliesInvalid   atomic.Uint64
 	Retransmits      atomic.Uint64
@@ -24,7 +27,19 @@ type JobMetrics struct {
 	// provider key, recorded at every attempt (ℓ = 0 included)
 	ProxyCPLSum   atomic.Uint64
 	ProxyCPLCount atomic.Uint64
-	JobsSucceeded atomic.Uint64
+	// initiator-edge bias diagnostics, recorded per attempt when a
+	// PeerState is configured (bias disabled included). FirstHop* cover
+	// the forward first hop (k per attempt), SurbLast* the last relay of
+	// each return path (k·m per attempt); the addr counters are the c_I
+	// diagnostic on the first hop only, an observation that never steers
+	// selection
+	FirstHopConnected    atomic.Uint64
+	FirstHopUnconnected  atomic.Uint64
+	FirstHopWithAddrs    atomic.Uint64
+	FirstHopWithoutAddrs atomic.Uint64
+	SurbLastConnected    atomic.Uint64
+	SurbLastUnconnected  atomic.Uint64
+	JobsSucceeded        atomic.Uint64
 	JobsFailed    atomic.Uint64
 	JobsTimedOut  atomic.Uint64
 	JobsCanceled  atomic.Uint64
@@ -34,17 +49,24 @@ type JobMetricsSnapshot struct {
 	JobsStarted       uint64
 	BranchPacketsSent uint64
 	SendFailures      uint64
-	RepliesWon        uint64
+	RepliesCollected  uint64
+	RepliesFailed     uint64
 	RepliesDuplicate  uint64
 	RepliesInvalid    uint64
 	Retransmits       uint64
 	RetransmitsFailed uint64
-	ProxyCPLSum       uint64
-	ProxyCPLCount     uint64
-	JobsSucceeded     uint64
-	JobsFailed        uint64
-	JobsTimedOut      uint64
-	JobsCanceled      uint64
+	ProxyCPLSum          uint64
+	ProxyCPLCount        uint64
+	FirstHopConnected    uint64
+	FirstHopUnconnected  uint64
+	FirstHopWithAddrs    uint64
+	FirstHopWithoutAddrs uint64
+	SurbLastConnected    uint64
+	SurbLastUnconnected  uint64
+	JobsSucceeded        uint64
+	JobsFailed           uint64
+	JobsTimedOut         uint64
+	JobsCanceled         uint64
 }
 
 func (m *JobMetrics) Snapshot() JobMetricsSnapshot {
@@ -52,17 +74,24 @@ func (m *JobMetrics) Snapshot() JobMetricsSnapshot {
 		JobsStarted:       m.JobsStarted.Load(),
 		BranchPacketsSent: m.BranchPacketsSent.Load(),
 		SendFailures:      m.SendFailures.Load(),
-		RepliesWon:        m.RepliesWon.Load(),
+		RepliesCollected:  m.RepliesCollected.Load(),
+		RepliesFailed:     m.RepliesFailed.Load(),
 		RepliesDuplicate:  m.RepliesDuplicate.Load(),
 		RepliesInvalid:    m.RepliesInvalid.Load(),
 		Retransmits:       m.Retransmits.Load(),
 		RetransmitsFailed: m.RetransmitsFailed.Load(),
-		ProxyCPLSum:       m.ProxyCPLSum.Load(),
-		ProxyCPLCount:     m.ProxyCPLCount.Load(),
-		JobsSucceeded:     m.JobsSucceeded.Load(),
-		JobsFailed:        m.JobsFailed.Load(),
-		JobsTimedOut:      m.JobsTimedOut.Load(),
-		JobsCanceled:      m.JobsCanceled.Load(),
+		ProxyCPLSum:          m.ProxyCPLSum.Load(),
+		ProxyCPLCount:        m.ProxyCPLCount.Load(),
+		FirstHopConnected:    m.FirstHopConnected.Load(),
+		FirstHopUnconnected:  m.FirstHopUnconnected.Load(),
+		FirstHopWithAddrs:    m.FirstHopWithAddrs.Load(),
+		FirstHopWithoutAddrs: m.FirstHopWithoutAddrs.Load(),
+		SurbLastConnected:    m.SurbLastConnected.Load(),
+		SurbLastUnconnected:  m.SurbLastUnconnected.Load(),
+		JobsSucceeded:        m.JobsSucceeded.Load(),
+		JobsFailed:           m.JobsFailed.Load(),
+		JobsTimedOut:         m.JobsTimedOut.Load(),
+		JobsCanceled:         m.JobsCanceled.Load(),
 	}
 }
 

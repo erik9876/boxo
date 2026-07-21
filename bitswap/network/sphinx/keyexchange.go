@@ -10,6 +10,7 @@ import (
 	"time"
 
 	logging "github.com/ipfs/go-log/v2"
+	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -18,56 +19,104 @@ import (
 
 var log = logging.Logger("bitswap/network/sphinx")
 
-const ProtocolKeyExchange protocol.ID = "/sphinx/keys/1.0.0"
+const ProtocolKeyExchange protocol.ID = "/sphinx/keys/2.0.0"
 
 const (
 	// a sealed record is a few hundred bytes; the cap blocks memory
 	// exhaustion via lying length prefixes
 	maxMessageSize = 4096
 
-	// bounds one whole exchange on a stream
+	// bounds one fetch or serve on a stream
 	exchangeTimeout = 10 * time.Second
 )
 
-// KeyExchange runs the symmetric key exchange: each side sends its sealed
-// KeyRecord and validates the other's. Triggered for peers connected at
-// construction, on every new connection, and periodically for records
-// close to expiry
+// KeyExchange is the pull side and, on relays, the serving side of the
+// key protocol: every node fetches the sealed KeyRecord of peers it
+// connects to, only relay-mode nodes answer with their own. Fetches are
+// triggered for peers connected at construction, on every new connection,
+// and periodically for records close to expiry
 type KeyExchange struct {
 	host  host.Host
 	km    *KeyManager
 	store *KeyStore
 
+	// the exact protocol IDs whose presence makes ModeAuto serve
+	kadProtos []protocol.ID
+
 	// how close to expiry a record may get before the refresh loop
-	// re-runs the exchange
+	// re-runs the fetch
 	refreshWindow time.Duration
 
 	notifiee *network.NotifyBundle
 	done     chan struct{}
+
+	// servingMu guards serving and the handler mount together, separate
+	// from mu so the host call, which emits on the event bus, never runs
+	// while mu is held
+	servingMu sync.Mutex
+	serving   bool
+	// onServing, when set, is called under servingMu after every serving
+	// change with the new state, so the relay transport can follow: a
+	// serving node mounts the relay handler, a client removes it
+	onServing func(bool)
 
 	mu       sync.Mutex
 	closed   bool
 	inflight map[peer.ID]struct{}
 }
 
-func NewKeyExchange(h host.Host, km *KeyManager, store *KeyStore) *KeyExchange {
+func NewKeyExchange(h host.Host, km *KeyManager, store *KeyStore, mode Mode, kadProtos []protocol.ID) (*KeyExchange, error) {
+	if len(kadProtos) == 0 {
+		kadProtos = DefaultKadServerProtocols
+	}
+	// a node whose own identity cannot map to a NodeID never serves,
+	// regardless of configured mode: its record could never enter any
+	// pool, so serving would be pure waste, and paired with handleStream's
+	// reverse trigger, two such nodes in relay mode would ping-pong
+	// fetches at RTT pace for the connection's lifetime. Clamping here
+	// kills the loop at the root, the counterpart's fetch simply fails
+	// negotiation and no reverse trigger ever fires from this side
+	if _, err := NodeIDFromPeer(km.PeerID()); err != nil {
+		if mode != ModeClient {
+			log.Warnw("clamping sphinx mode to client: own identity cannot serve as a hop",
+				"peer", km.PeerID(), "configured_mode", mode, "error", err)
+		}
+		mode = ModeClient
+	}
 	kx := &KeyExchange{
 		host:          h,
 		km:            km,
 		store:         store,
+		kadProtos:     kadProtos,
 		refreshWindow: km.ttl / 4,
 		done:          make(chan struct{}),
 		inflight:      make(map[peer.ID]struct{}),
 	}
+	switch mode {
+	case ModeRelay:
+		kx.setServing(true)
+	case ModeClient:
+		// never serves; nothing to mount
+	case ModeAuto:
+		sub, err := h.EventBus().Subscribe(new(event.EvtLocalProtocolsUpdated))
+		if err != nil {
+			return nil, fmt.Errorf("subscribing to protocol updates: %w", err)
+		}
+		// subscribe before the initial scan so no promotion between scan
+		// and subscription is lost; a duplicate rescan is idempotent
+		kx.setServing(kadServerMounted(h, kx.kadProtos))
+		go kx.pumpProtocolEvents(sub, kx.watchServing())
+	default:
+		return nil, fmt.Errorf("invalid sphinx mode %d", mode)
+	}
 	kx.notifiee = &network.NotifyBundle{ConnectedF: kx.onConnected}
-	h.SetStreamHandler(ProtocolKeyExchange, kx.handleStream)
 	h.Network().Notify(kx.notifiee)
 	// peers connected before construction never fire the notifiee
 	for _, p := range h.Network().Peers() {
 		kx.triggerExchange(p)
 	}
 	go kx.refreshLoop(refreshInterval(km.ttl))
-	return kx
+	return kx, nil
 }
 
 // must undercut the refresh window (ttl/4) so every expiring record is
@@ -80,7 +129,93 @@ func refreshInterval(ttl time.Duration) time.Duration {
 	return iv
 }
 
-// Close stops the refresh loop, notifiee and handler; in-flight exchanges
+// setServing mounts or removes the serving handler. Single writer after
+// construction; lock order servingMu before mu, and Close removes the
+// handler under servingMu too, so a mount can never survive Close
+func (kx *KeyExchange) setServing(on bool) {
+	kx.servingMu.Lock()
+	defer kx.servingMu.Unlock()
+	kx.mu.Lock()
+	closed := kx.closed
+	kx.mu.Unlock()
+	if closed || on == kx.serving {
+		return
+	}
+	kx.serving = on
+	if on {
+		kx.host.SetStreamHandler(ProtocolKeyExchange, kx.handleStream)
+	} else {
+		kx.host.RemoveStreamHandler(ProtocolKeyExchange)
+	}
+	if kx.onServing != nil {
+		kx.onServing(on)
+	}
+}
+
+// Serving reports whether the node currently answers key fetches
+func (kx *KeyExchange) Serving() bool {
+	kx.servingMu.Lock()
+	defer kx.servingMu.Unlock()
+	return kx.serving
+}
+
+// SetServingCallback registers f, called with the serving state on every
+// change from here on. NewService uses it to mount and unmount the relay
+// handler alongside the key handler. The caller runs the initial sync
+// itself: the construction-time state predates this call, and a static
+// client never triggers a change to report
+func (kx *KeyExchange) SetServingCallback(f func(bool)) {
+	kx.servingMu.Lock()
+	kx.onServing = f
+	kx.servingMu.Unlock()
+}
+
+// pumpProtocolEvents drains the subscription and coalesces into a 1-slot
+// signal. Two stages on purpose: the go-libp2p event bus delivery blocks
+// on full subscriber buffers, and setServing itself emits a protocol
+// event when it mounts or removes the handler. A consumer that emits
+// could deadlock against its own full buffer; the pump never blocks, so
+// the bus never backs up on this subscription
+func (kx *KeyExchange) pumpProtocolEvents(sub event.Subscription, recheck chan<- struct{}) {
+	defer sub.Close()
+	for {
+		select {
+		case <-kx.done:
+			return
+		case _, ok := <-sub.Out():
+			if !ok {
+				return
+			}
+			select {
+			case recheck <- struct{}{}:
+			default:
+			}
+		}
+	}
+}
+
+// watchServing starts the applying goroutine and returns its signal
+// channel. Every signal triggers a full rescan of the mounted protocols
+// instead of interpreting event deltas; rescans are idempotent, so the
+// event fired by our own mount converges after one extra pass. The guard
+// against a mount->emit->rescan busy-loop is setServing's on == kx.serving
+// early-return, not the rescan itself
+func (kx *KeyExchange) watchServing() chan struct{} {
+	recheck := make(chan struct{}, 1)
+	go func() {
+		for {
+			select {
+			case <-kx.done:
+				return
+			case <-recheck:
+				kx.setServing(kadServerMounted(kx.host, kx.kadProtos))
+			}
+		}
+	}()
+	return recheck
+}
+
+// Close stops the refresh loop, notifiee and handler; in-flight fetches
 // may finish
 func (kx *KeyExchange) Close() error {
 	kx.mu.Lock()
@@ -93,66 +228,67 @@ func (kx *KeyExchange) Close() error {
 
 	close(kx.done)
 	kx.host.Network().StopNotify(kx.notifiee)
+	kx.servingMu.Lock()
+	kx.serving = false
 	kx.host.RemoveStreamHandler(ProtocolKeyExchange)
+	kx.servingMu.Unlock()
 	return nil
 }
 
-// RequestKeys runs one exchange with p as initiator
-func (kx *KeyExchange) RequestKeys(ctx context.Context, p peer.ID) error {
+// FetchKeys pulls p's key record over one stream. Peers that do not
+// serve the protocol fail the negotiation, which is the capability
+// filter: clients and vanilla IPFS nodes are skipped the same way
+func (kx *KeyExchange) FetchKeys(ctx context.Context, p peer.ID) error {
 	s, err := kx.host.NewStream(ctx, p, ProtocolKeyExchange)
 	if err != nil {
-		return fmt.Errorf("opening key exchange stream to %s: %w", p, err)
+		return fmt.Errorf("opening key fetch stream to %s: %w", p, err)
 	}
 	deadline := time.Now().Add(exchangeTimeout)
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d
 	}
-	if err := kx.runExchange(s, deadline, true); err != nil {
+	if err := kx.fetch(s, deadline); err != nil {
 		_ = s.Reset()
 		return err
 	}
 	return s.Close()
 }
 
-// responder side: receive and validate first, then answer
+func (kx *KeyExchange) fetch(s network.Stream, deadline time.Time) error {
+	if err := s.SetDeadline(deadline); err != nil {
+		return fmt.Errorf("setting stream deadline: %w", err)
+	}
+	raw, err := readFrame(s)
+	if err != nil {
+		return err
+	}
+	return kx.acceptRecord(raw, s.Conn().RemotePeer())
+}
+
+// the serving side: one frame with the own sealed record, no read
 func (kx *KeyExchange) handleStream(s network.Stream) {
-	if err := kx.runExchange(s, time.Now().Add(exchangeTimeout), false); err != nil {
-		log.Debugw("inbound key exchange failed", "peer", s.Conn().RemotePeer(), "error", err)
+	if err := kx.serveKey(s); err != nil {
+		log.Debugw("serving key record failed", "peer", s.Conn().RemotePeer(), "error", err)
 		_ = s.Reset()
 		return
 	}
 	_ = s.Close()
+	// a fetcher is a sphinx node; opportunistically pull its record so
+	// two relays coming up on an existing connection fill both pools
+	// without waiting for the refresh tick. Clients fail the negotiation
+	// as usual
+	kx.triggerExchange(s.Conn().RemotePeer())
 }
 
-// initiator writes first, responder reads first
-func (kx *KeyExchange) runExchange(s network.Stream, deadline time.Time, initiator bool) error {
-	if err := s.SetDeadline(deadline); err != nil {
+func (kx *KeyExchange) serveKey(s network.Stream) error {
+	if err := s.SetDeadline(time.Now().Add(exchangeTimeout)); err != nil {
 		return fmt.Errorf("setting stream deadline: %w", err)
 	}
-	send := func() error {
-		own, err := kx.km.SealedRecord()
-		if err != nil {
-			return fmt.Errorf("sealing own key record: %w", err)
-		}
-		return writeFrame(s, own)
+	own, err := kx.km.SealedRecord()
+	if err != nil {
+		return fmt.Errorf("sealing own key record: %w", err)
 	}
-	receive := func() error {
-		raw, err := readFrame(s)
-		if err != nil {
-			return err
-		}
-		return kx.acceptRecord(raw, s.Conn().RemotePeer())
-	}
-	if initiator {
-		if err := send(); err != nil {
-			return err
-		}
-		return receive()
-	}
-	if err := receive(); err != nil {
-		return err
-	}
-	return send()
+	return writeFrame(s, own)
 }
 
 // acceptRecord validates and stores raw. A peer may only advertise its own
@@ -214,7 +350,7 @@ func (kx *KeyExchange) triggerExchange(p peer.ID) {
 		defer kx.finish(p)
 		ctx, cancel := context.WithTimeout(context.Background(), exchangeTimeout)
 		defer cancel()
-		if err := kx.RequestKeys(ctx, p); err != nil {
+		if err := kx.FetchKeys(ctx, p); err != nil {
 			// peers without the protocol are skipped; negotiation failure
 			// is the capability filter
 			log.Debugw("triggered key exchange skipped", "peer", p, "error", err)

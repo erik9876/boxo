@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/ipfs/boxo/bitswap/client"
+	"github.com/ipfs/boxo/bitswap/network"
 	"github.com/ipfs/boxo/bitswap/server"
 	"github.com/ipfs/boxo/bitswap/tracer"
 )
@@ -44,6 +45,15 @@ func TaskWorkerCount(count int) Option {
 
 func SetSendDontHaves(send bool) Option {
 	return Option{server.SetSendDontHaves(send)}
+}
+
+// WithExtraReceivers registers additional receivers on the network next to
+// the client and server. They observe every inbound message but cannot
+// consume them: client and server see each message regardless
+func WithExtraReceivers(rs ...network.Receiver) Option {
+	return Option{option(func(bs *Bitswap) {
+		bs.extraReceivers = append(bs.extraReceivers, rs...)
+	})}
 }
 
 func WithPeerBlockRequestFilter(pbrf server.PeerBlockRequestFilter) Option {

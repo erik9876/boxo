@@ -19,7 +19,7 @@ type jobNode struct {
 	jobs  *JobManager
 }
 
-func newJobNode(t *testing.T, disc ProviderDiscoverer) *jobNode {
+func newJobNode(t *testing.T, disc ProviderDiscoverer, jobTimeout time.Duration) *jobNode {
 	t.Helper()
 	h := newTestHost(t)
 	idPriv := h.Peerstore().PrivKey(h.ID())
@@ -44,7 +44,7 @@ func newJobNode(t *testing.T, disc ProviderDiscoverer) *jobNode {
 	if err != nil {
 		t.Fatalf("NewProxy: %v", err)
 	}
-	jobs, err := NewJobManager(tr, km, pool, surbs, JobConfig{Timeout: 20 * time.Second})
+	jobs, err := NewJobManager(tr, km, pool, surbs, JobConfig{Timeout: jobTimeout})
 	if err != nil {
 		t.Fatalf("NewJobManager: %v", err)
 	}
@@ -57,13 +57,13 @@ func newJobNode(t *testing.T, disc ProviderDiscoverer) *jobNode {
 // newJobCluster wires an initiator plus enough pool nodes for one attempt
 // at the default k and m, connects every pair, and teaches the initiator's
 // pool all other nodes, as the key exchange would have
-func newJobCluster(t *testing.T, disc ProviderDiscoverer) (initiator *jobNode, poolNodes []*jobNode) {
+func newJobCluster(t *testing.T, disc ProviderDiscoverer, jobTimeout time.Duration) (initiator *jobNode, poolNodes []*jobNode) {
 	t.Helper()
-	initiator = newJobNode(t, disc)
+	initiator = newJobNode(t, disc, jobTimeout)
 	poolNodes = make([]*jobNode, jobSampleSize(DefaultBranchesPerJob, ReturnPathsPerJob))
 	hosts := []host.Host{initiator.host}
 	for i := range poolNodes {
-		poolNodes[i] = newJobNode(t, disc)
+		poolNodes[i] = newJobNode(t, disc, jobTimeout)
 		hosts = append(hosts, poolNodes[i].host)
 	}
 	connectAll(t, hosts...)
@@ -112,30 +112,31 @@ func runJobToSuccess(t *testing.T, initiator *jobNode, want []peer.AddrInfo) {
 }
 
 // full loopback flow at k = 2: both branches through three hops to their
-// proxies, fake discovery, first reply settles the job byte-identically,
-// the other branch's replies die as duplicates
+// proxies, fake discovery, the two identical answers complete the quorum
+// and merge byte-identically, later copies die as duplicates
 func TestDiscoveryJobEndToEnd(t *testing.T) {
 	want := testProviders(t, 3)
 	disc := &fakeDiscoverer{providers: want}
 
 	// k·(NrHops + 2m) = 18 distinct pool relays at the defaults; with the
 	// initiator that is nineteen hosts
-	initiator, _ := newJobCluster(t, disc)
+	initiator, _ := newJobCluster(t, disc, 20*time.Second)
 	runJobToSuccess(t, initiator, want)
 }
 
 // TestJobSurvivesDeadRelay kills one pool node outright before the job
 // starts. Full per-job disjointness confines the dead relay to exactly one
-// branch, whether as first hop (the send fails, a tolerated dead branch)
-// or a silent packet loss further along, so the other branch stays fully
-// alive and must settle the job without any retransmit
+// branch, whether as first hop (the send fails, a tolerated dead branch
+// that leaves the quorum to the live one) or a silent packet loss further
+// along (the live branch's answer settles at the attempt timer, hence the
+// short timeout here), so the job must settle without any retransmit
 func TestJobSurvivesDeadRelay(t *testing.T) {
 	want := testProviders(t, 3)
 	disc := &fakeDiscoverer{providers: want}
 
 	// Pool exactly one attempt's demand, so the dead node is drawn with
 	// certainty
-	initiator, poolNodes := newJobCluster(t, disc)
+	initiator, poolNodes := newJobCluster(t, disc, 2*time.Second)
 	if err := poolNodes[0].host.Close(); err != nil {
 		t.Fatalf("killing pool node: %v", err)
 	}

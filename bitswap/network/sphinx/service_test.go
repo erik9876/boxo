@@ -9,6 +9,7 @@ import (
 
 	rpqm "github.com/ipfs/boxo/routing/providerquerymanager"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 )
@@ -24,6 +25,7 @@ func newServiceCluster(t *testing.T, n int, disc ProviderDiscoverer, cfg Service
 	for i := range svcs {
 		h := newTestHost(t)
 		nodeCfg := cfg
+		nodeCfg.Mode = ModeRelay
 		nodeCfg.Proxy.Discoverer = disc
 		svc, err := NewService(h, h.Peerstore().PrivKey(h.ID()), nil, nodeCfg)
 		if err != nil {
@@ -105,6 +107,117 @@ func TestServiceEndToEnd(t *testing.T) {
 	}
 }
 
+// TestServiceClientMode: a ModeClient service fills its pool from relays
+// and never appears in theirs, but is refused when it tries to initiate:
+// only relay-set members start jobs
+func TestServiceClientMode(t *testing.T) {
+	cfg := ServiceConfig{Job: JobConfig{Branches: 1, ReturnPaths: 1, Timeout: 20 * time.Second}}
+	disc := &fakeDiscoverer{}
+	svcs, hosts := newServiceCluster(t, jobSampleSize(1, 1), disc, cfg)
+
+	hc := newTestHost(t)
+	clientCfg := cfg
+	clientCfg.Mode = ModeClient
+	clientCfg.Proxy.Discoverer = disc
+	clientSvc, err := NewService(hc, hc.Peerstore().PrivKey(hc.ID()), nil, clientCfg)
+	if err != nil {
+		t.Fatalf("NewService client: %v", err)
+	}
+	defer clientSvc.Close()
+	for _, h := range hosts {
+		connect(t, hc, h)
+	}
+
+	waitForPool(t, clientSvc)
+	if got := clientSvc.Mode(); got != ModeClient {
+		t.Errorf("client Mode() = %v, want ModeClient", got)
+	}
+	if got := svcs[0].Mode(); got != ModeRelay {
+		t.Errorf("relay Mode() = %v, want ModeRelay", got)
+	}
+	// relays fetch from the client the moment it connects and fail the
+	// negotiation; no record can ever exist for it
+	for i, svc := range svcs {
+		if _, ok := svc.pool.Get(hc.ID()); ok {
+			t.Errorf("relay %d pools the client key", i)
+		}
+	}
+
+	// the client harvests keys but cannot initiate: a client-mode start is
+	// refused before any packet leaves
+	if _, err := clientSvc.Jobs().StartJob(context.Background(), testCID(t)); !errors.Is(err, ErrClientMode) {
+		t.Fatalf("client-mode StartJob: err = %v, want ErrClientMode", err)
+	}
+}
+
+// TestServiceClientModeUnmountsHandlers: a ModeClient node advertises
+// neither sphinx protocol, so at the protocol level it is indistinguishable
+// from a vanilla node; it still harvests keys as a fetcher
+func TestServiceClientModeUnmountsHandlers(t *testing.T) {
+	h := newTestHost(t)
+	svc, err := NewService(h, h.Peerstore().PrivKey(h.ID()), nil, ServiceConfig{
+		Mode:  ModeClient,
+		Proxy: ProxyConfig{Discoverer: &fakeDiscoverer{}},
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	defer svc.Close()
+	for _, proto := range []protocol.ID{ProtocolRelay, ProtocolKeyExchange} {
+		if slices.Contains(h.Mux().Protocols(), proto) {
+			t.Errorf("client-mode node advertises %s", proto)
+		}
+	}
+}
+
+// TestServiceRelayModeMountsHandlers: a ModeRelay node advertises both the
+// relay transport and the key protocol
+func TestServiceRelayModeMountsHandlers(t *testing.T) {
+	h := newTestHost(t)
+	svc, err := NewService(h, h.Peerstore().PrivKey(h.ID()), nil, ServiceConfig{
+		Mode:  ModeRelay,
+		Proxy: ProxyConfig{Discoverer: &fakeDiscoverer{}},
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	defer svc.Close()
+	for _, proto := range []protocol.ID{ProtocolRelay, ProtocolKeyExchange} {
+		if !slices.Contains(h.Mux().Protocols(), proto) {
+			t.Errorf("relay-mode node does not advertise %s", proto)
+		}
+	}
+}
+
+// TestServiceAutoModeRelayHandlerFollows: under ModeAuto the relay handler
+// tracks the serving state, mounting on promotion and unmounting on
+// demotion in lockstep with the key handler
+func TestServiceAutoModeRelayHandlerFollows(t *testing.T) {
+	fork := protocol.ID("/myfork/kad/1.0.0")
+	h := newTestHost(t)
+	svc, err := NewService(h, h.Peerstore().PrivKey(h.ID()), nil, ServiceConfig{
+		Mode:               ModeAuto,
+		KadServerProtocols: []protocol.ID{fork},
+		Proxy:              ProxyConfig{Discoverer: &fakeDiscoverer{}},
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	defer svc.Close()
+
+	if slices.Contains(h.Mux().Protocols(), ProtocolRelay) {
+		t.Fatal("auto-mode node advertises the relay handler before promotion")
+	}
+	h.SetStreamHandler(fork, func(s network.Stream) { _ = s.Reset() })
+	waitFor(t, 10*time.Second, "the relay handler to mount on promotion", func() bool {
+		return slices.Contains(h.Mux().Protocols(), ProtocolRelay)
+	})
+	h.RemoveStreamHandler(fork)
+	waitFor(t, 10*time.Second, "the relay handler to unmount on demotion", func() bool {
+		return !slices.Contains(h.Mux().Protocols(), ProtocolRelay)
+	})
+}
+
 // TestServiceCloseSettlesPendingJobs: Close settles an in-flight job with
 // ErrManagerClosed while proxies are still busy, rejects later jobs, and
 // deregisters both protocol handlers
@@ -163,6 +276,49 @@ func TestServiceConstructionErrors(t *testing.T) {
 	if _, err := NewService(nil, foreign, nil, ServiceConfig{}); err == nil {
 		t.Error("NewService accepted a nil host")
 	}
+}
+
+// TestNewServiceInjectsHostPeerState: with no PeerState in the config,
+// NewService must back the job manager from the host so the initiator-edge
+// bias runs by default
+func TestNewServiceInjectsHostPeerState(t *testing.T) {
+	h := newTestHost(t)
+	svc, err := NewService(h, h.Peerstore().PrivKey(h.ID()), nil, ServiceConfig{
+		Proxy: ProxyConfig{Discoverer: &fakeDiscoverer{}},
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	defer svc.Close()
+	if svc.jobs.state == nil {
+		t.Fatal("NewService left the job manager PeerState nil")
+	}
+}
+
+// TestServiceKadServerProtocolsThreaded: a custom KadServerProtocols list
+// passed through ServiceConfig must reach the underlying KeyExchange, not
+// just fall back to DefaultKadServerProtocols
+func TestServiceKadServerProtocolsThreaded(t *testing.T) {
+	fork := protocol.ID("/myfork/kad/1.0.0")
+	h := newTestHost(t)
+	svc, err := NewService(h, h.Peerstore().PrivKey(h.ID()), nil, ServiceConfig{
+		Mode:               ModeAuto,
+		KadServerProtocols: []protocol.ID{fork},
+		Proxy:              ProxyConfig{Discoverer: &fakeDiscoverer{}},
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	defer svc.Close()
+
+	if got := svc.Mode(); got != ModeClient {
+		t.Fatalf("initial Mode() = %v, want ModeClient", got)
+	}
+
+	h.SetStreamHandler(fork, func(s network.Stream) { _ = s.Reset() })
+	waitFor(t, 10*time.Second, "promotion via the configured kad protocol", func() bool {
+		return svc.Mode() == ModeRelay
+	})
 }
 
 // TestServicePoolStatus: live tracks the pool through fills and expiry,

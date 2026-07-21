@@ -52,8 +52,9 @@ type Bitswap struct {
 	*server.Server
 
 	tracer        tracer.Tracer
-	net           network.BitSwapNetwork
-	serverEnabled bool
+	net            network.BitSwapNetwork
+	serverEnabled  bool
+	extraReceivers []network.Receiver
 }
 
 func New(ctx context.Context, net network.BitSwapNetwork, providerFinder routing.ContentDiscovery, bstore blockstore.Blockstore, options ...Option) *Bitswap {
@@ -90,7 +91,9 @@ func New(ctx context.Context, net network.BitSwapNetwork, providerFinder routing
 		clientOptions = append(clientOptions, client.WithBlockReceivedNotifier(bs.Server))
 	}
 	bs.Client = client.New(ctx, net, providerFinder, bstore, clientOptions...)
-	net.Start(bs) // use the polyfill receiver to log received errors and trace messages only once
+	// the polyfill receiver logs received errors and traces messages only
+	// once; extra receivers ride along on the same fan-out
+	net.Start(append([]network.Receiver{bs}, bs.extraReceivers...)...)
 
 	return bs
 }

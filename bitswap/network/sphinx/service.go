@@ -8,8 +8,11 @@ import (
 
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/core/routing"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 const DefaultKeyTTL = time.Hour
@@ -17,7 +20,8 @@ const DefaultKeyTTL = time.Hour
 type ServiceConfig struct {
 	Job JobConfig
 	// Proxy.Discoverer may stay nil: discovery then runs against the
-	// ContentRouting given to NewService. Non-nil = test seam
+	// ContentRouting given to NewService, DHT only. A
+	// ProbeThenRouteDiscoverer adds the vanilla WANT-HAVE stage in front
 	Proxy ProxyConfig
 	// zero means DefaultKeyTTL
 	KeyTTL time.Duration
@@ -26,6 +30,14 @@ type ServiceConfig struct {
 	// traffic: no hop reveals through its behavior whether it had to
 	// resolve its successor. Nil dials straight from the peerstore
 	PeerRouting PeerFinder
+	// Mode gates key serving: ModeRelay serves the own key, ModeClient
+	// never does, ModeAuto (zero value) follows the host's mounted kad
+	// server protocol. Serving is the only role-gated piece; relay,
+	// proxy and initiator stay active in every mode
+	Mode Mode
+	// KadServerProtocols is the exact set ModeAuto matches against the
+	// host's mounted protocols; empty means DefaultKadServerProtocols
+	KadServerProtocols []protocol.ID
 }
 
 // Service is one full Sphinx node on a libp2p host: key layer, packet
@@ -68,6 +80,9 @@ func NewService(h host.Host, identity crypto.PrivKey, rt routing.ContentRouting,
 		}
 		cfg.Proxy.Discoverer = ContentRoutingDiscoverer{Routing: rt}
 	}
+	if cfg.Job.PeerState == nil {
+		cfg.Job.PeerState = hostPeerState{h}
+	}
 
 	km, err := NewKeyManager(identity, cfg.KeyTTL)
 	if err != nil {
@@ -90,6 +105,12 @@ func NewService(h host.Host, identity crypto.PrivKey, rt routing.ContentRouting,
 		_ = tr.Close()
 		return nil, err
 	}
+	// gate the initiator role on serving: only relay-set members start jobs,
+	// so their first hop cannot tell origination from forwarding. kx is
+	// assigned below; the job manager reads this only after construction,
+	// when it is set, and picks up ModeAuto flips live
+	var kx *KeyExchange
+	cfg.Job.ServingCheck = func() bool { return kx != nil && kx.Serving() }
 	jobs, err := NewJobManager(tr, km, pool, surbs, cfg.Job)
 	if err != nil {
 		_ = tr.Close()
@@ -98,9 +119,20 @@ func NewService(h host.Host, identity crypto.PrivKey, rt routing.ContentRouting,
 	mux.SetProxy(proxy)
 	mux.SetJobs(jobs)
 
-	// key exchange last: from here on peers may send packets, and the
+	// key exchange last: from here on peers may fetch the key, and the
 	// relay handler above is already serving
-	kx := NewKeyExchange(h, km, pool)
+	kx, err = NewKeyExchange(h, km, pool, cfg.Mode, cfg.KadServerProtocols)
+	if err != nil {
+		jobs.Close()
+		_ = tr.Close()
+		return nil, err
+	}
+	// the relay handler follows the serving state, so a client-mode node
+	// advertises no sphinx protocol at all. The callback carries later
+	// ModeAuto flips; the explicit sync reconciles the construction-time
+	// state, which predates the callback and never fires for a static client
+	kx.SetServingCallback(tr.setServing)
+	tr.setServing(kx.Serving())
 
 	return &Service{
 		km:    km,
@@ -126,8 +158,28 @@ func (s *Service) Close() error {
 	return nil
 }
 
+// hostPeerState feeds the initiator-edge bias from the live host
+type hostPeerState struct{ h host.Host }
+
+func (s hostPeerState) Connectedness(p peer.ID) network.Connectedness {
+	return s.h.Network().Connectedness(p)
+}
+
+func (s hostPeerState) Addrs(p peer.ID) []ma.Multiaddr {
+	return s.h.Peerstore().Addrs(p)
+}
+
 // Jobs is the seam the ProviderFinder adapter plugs into
 func (s *Service) Jobs() *JobManager { return s.jobs }
+
+// Mode reports the effective serving state, ModeRelay or ModeClient;
+// under ModeAuto this follows the host's kad server protocol
+func (s *Service) Mode() Mode {
+	if s.kx.Serving() {
+		return ModeRelay
+	}
+	return ModeClient
+}
 
 func (s *Service) JobMetrics() JobMetricsSnapshot { return s.jobs.Metrics() }
 

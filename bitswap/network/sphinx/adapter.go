@@ -26,8 +26,8 @@ func NewProviderFinder(jobs JobStarter) *ProviderFinder {
 	return &ProviderFinder{jobs: jobs}
 }
 
-// FindProvidersAsync launches one job for c and streams the winning
-// reply's providers (at most count, all for count <= 0), then closes the
+// FindProvidersAsync launches one job for c and streams the job's merged
+// providers (at most count, all for count <= 0), then closes the
 // channel. Every failure = empty closed channel; no fallback to vanilla
 // discovery. A dying ctx stops the wait but not the job, which settles on
 // its own timers

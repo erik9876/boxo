@@ -131,8 +131,8 @@ func (p *Proxy) runJob(job *Job) {
 	ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
 	defer cancel()
 
-	// TODO: vanilla nodes broadcast WANT-HAVE to connected peers before
-	// falling back to the DHT; wiring that in touches bitswap/client
+	// a ProbeThenRouteDiscoverer runs the vanilla two-stage lookup here:
+	// WANT-HAVE to the neighbors first, the DHT only on an empty probe
 	status := ReplyStatusOK
 	providers, err := p.disc.FindProviders(ctx, job.CID, MaxProvidersPerReply)
 	if err != nil {

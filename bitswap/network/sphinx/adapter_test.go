@@ -51,11 +51,11 @@ func collectProviders(t *testing.T, ch <-chan peer.AddrInfo, d time.Duration) []
 }
 
 // TestProviderFinderStreamsProviders runs the adapter over the fully wired
-// loopback stack: FindProvidersAsync in, the winning reply's providers
-// out, channel closed
+// loopback stack: FindProvidersAsync in, the merged quorum providers out,
+// channel closed
 func TestProviderFinderStreamsProviders(t *testing.T) {
 	want := testProviders(t, 3)
-	initiator, _ := newJobCluster(t, &fakeDiscoverer{providers: want})
+	initiator, _ := newJobCluster(t, &fakeDiscoverer{providers: want}, 20*time.Second)
 	finder := NewProviderFinder(initiator.jobs)
 
 	got := collectProviders(t, finder.FindProvidersAsync(context.Background(), testCID(t), 0), 30*time.Second)

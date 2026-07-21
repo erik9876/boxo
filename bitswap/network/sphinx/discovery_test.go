@@ -10,7 +10,9 @@ import (
 	"time"
 
 	kb "github.com/libp2p/go-libp2p-kbucket"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 // pendingCounts reports registered jobs and SURB mappings; test hook
@@ -209,7 +211,8 @@ func TestBranchSendFailureDoesNotFailJob(t *testing.T) {
 		t.Errorf("send counters = %d failed / %d sent, want 1 / 1", met.SendFailures, met.BranchPacketsSent)
 	}
 
-	// A reply through any registered SURB settles the job as usual
+	// The dead branch cannot answer and does not block the quorum: the
+	// live branch's reply settles the job on its own
 	want := testProviders(t, 3)
 	payload, err := EncodeReply(ReplyStatusOK, want)
 	if err != nil {
@@ -226,7 +229,8 @@ func TestBranchSendFailureDoesNotFailJob(t *testing.T) {
 	}
 }
 
-func TestFirstReplyWinsAndDuplicatesAreIgnored(t *testing.T) {
+// with a single branch the quorum is one answer: the first reply settles
+func TestSingleBranchSettlesOnFirstReply(t *testing.T) {
 	sender := &fakeSender{}
 	m := ReturnPathsPerJob
 	jm, surbs := newTestJobManager(t, sender, jobSampleSize(1, m), JobConfig{Branches: 1})
@@ -273,7 +277,7 @@ func TestFirstReplyWinsAndDuplicatesAreIgnored(t *testing.T) {
 	}
 }
 
-func TestDuplicateRepliesAcrossBranchesIgnored(t *testing.T) {
+func TestBothBranchAnswersCollectedThenMerged(t *testing.T) {
 	sender := &fakeSender{}
 	k, m := 2, 1 // one SURB per branch: two IDs, guaranteed on different branches
 	jm, surbs := newTestJobManager(t, sender, jobSampleSize(k, m), JobConfig{Branches: k, ReturnPaths: m})
@@ -292,23 +296,36 @@ func TestDuplicateRepliesAcrossBranchesIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EncodeReply: %v", err)
 	}
+
+	// The first branch's answer is collected, not settled: the other
+	// branch keeps its chance until the attempt timer
 	jm.HandleSURBReply(ids[0], payload)
+	select {
+	case got := <-res:
+		t.Fatalf("job settled before every branch answered: %+v", got)
+	default:
+	}
+
+	// The second answer completes the quorum; identical lists merge into
+	// the same list
+	jm.HandleSURBReply(ids[1], payload)
 	got, ok := <-res
 	if !ok || got.Err != nil {
 		t.Fatalf("job settled with ok=%v err=%v, want success", ok, got.Err)
 	}
+	assertProvidersEqual(t, got.Providers, want)
 
-	// The other branch's proxy answers too; the duplicate dies at the job table
-	jm.HandleSURBReply(ids[1], payload)
+	// Anything after the settle dies at the job table
+	jm.HandleSURBReply(ids[0], payload)
 	if _, ok := <-res; ok {
-		t.Error("a cross-branch duplicate produced a second result")
+		t.Error("a reply after the settle produced a second result")
 	}
 	met := jm.Metrics()
-	if met.RepliesWon != 1 || met.RepliesDuplicate != 1 {
-		t.Errorf("reply counters = %d won / %d duplicate, want 1 / 1", met.RepliesWon, met.RepliesDuplicate)
+	if met.RepliesCollected != 2 || met.RepliesDuplicate != 1 {
+		t.Errorf("reply counters = %d collected / %d duplicate, want 2 / 1", met.RepliesCollected, met.RepliesDuplicate)
 	}
 	if surbs.Len() != 0 {
-		t.Errorf("surb store holds %d entries after duplicates", surbs.Len())
+		t.Errorf("surb store holds %d entries after settle", surbs.Len())
 	}
 }
 
@@ -566,6 +583,267 @@ func TestFailedReplyStatusIsReported(t *testing.T) {
 	}
 }
 
+// a lone answer is good enough, but only once the attempt timer has given
+// every branch its chance
+func TestSingleAnswerSettlesAtTimerNotBefore(t *testing.T) {
+	sender := &fakeSender{}
+	k, m := 2, 1
+	timeout := 300 * time.Millisecond
+	jm, surbs := newTestJobManager(t, sender, jobSampleSize(k, m), JobConfig{Branches: k, ReturnPaths: m, Timeout: timeout})
+
+	res, err := jm.StartJob(context.Background(), testCID(t))
+	if err != nil {
+		t.Fatalf("StartJob: %v", err)
+	}
+	ids := jm.pendingSURBIDs()
+
+	want := testProviders(t, 3)
+	payload, err := EncodeReply(ReplyStatusOK, want)
+	if err != nil {
+		t.Fatalf("EncodeReply: %v", err)
+	}
+	jm.HandleSURBReply(ids[0], payload)
+	select {
+	case got := <-res:
+		t.Fatalf("job settled before the timer despite a silent branch: %+v", got)
+	default:
+	}
+
+	// the timer settles with what arrived instead of retransmitting
+	select {
+	case got, ok := <-res:
+		if !ok || got.Err != nil {
+			t.Fatalf("job settled with ok=%v err=%v, want the lone answer", ok, got.Err)
+		}
+		assertProvidersEqual(t, got.Providers, want)
+	case <-time.After(5 * time.Second):
+		t.Fatal("job never settled")
+	}
+	met := jm.Metrics()
+	if met.Retransmits != 0 || met.JobsSucceeded != 1 || met.JobsTimedOut != 0 {
+		t.Errorf("counters = %d retransmits / %d succeeded / %d timed out, want 0 / 1 / 0",
+			met.Retransmits, met.JobsSucceeded, met.JobsTimedOut)
+	}
+	if surbs.Len() != 0 {
+		t.Errorf("surb store holds %d entries after settle", surbs.Len())
+	}
+}
+
+// both lists merge into a union with the twice-named peer first and its
+// addresses combined
+func TestQuorumMergesListsWithSharedPeersFirst(t *testing.T) {
+	sender := &fakeSender{}
+	k, m := 2, 1
+	jm, _ := newTestJobManager(t, sender, jobSampleSize(k, m), JobConfig{Branches: k, ReturnPaths: m, Timeout: 10 * time.Second})
+
+	res, err := jm.StartJob(context.Background(), testCID(t))
+	if err != nil {
+		t.Fatalf("StartJob: %v", err)
+	}
+	ids := jm.pendingSURBIDs()
+
+	_, pidA := newIdentity(t)
+	_, pidB := newIdentity(t)
+	_, pidC := newIdentity(t)
+	addr1 := ma.StringCast("/ip4/10.0.0.1/tcp/4001")
+	addr2 := ma.StringCast("/ip4/10.0.0.2/tcp/4001")
+	list1 := []peer.AddrInfo{{ID: pidA}, {ID: pidB, Addrs: []ma.Multiaddr{addr1}}}
+	list2 := []peer.AddrInfo{{ID: pidB, Addrs: []ma.Multiaddr{addr2, addr1}}, {ID: pidC}}
+
+	for i, list := range [][]peer.AddrInfo{list1, list2} {
+		payload, err := EncodeReply(ReplyStatusOK, list)
+		if err != nil {
+			t.Fatalf("EncodeReply %d: %v", i, err)
+		}
+		jm.HandleSURBReply(ids[i], payload)
+	}
+
+	start := time.Now()
+	got, ok := <-res
+	if !ok || got.Err != nil {
+		t.Fatalf("job settled with ok=%v err=%v, want merged success", ok, got.Err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("complete quorum waited out the timer (%s)", elapsed)
+	}
+
+	if len(got.Providers) != 3 {
+		t.Fatalf("merged %d providers, want 3: %v", len(got.Providers), got.Providers)
+	}
+	// B is named by both branches and leads; A and C follow in arrival order
+	if got.Providers[0].ID != pidB || got.Providers[1].ID != pidA || got.Providers[2].ID != pidC {
+		t.Fatalf("merged order %v, want [%s %s %s]", got.Providers, pidB, pidA, pidC)
+	}
+	bAddrs := got.Providers[0].Addrs
+	if len(bAddrs) != 2 || !bAddrs[0].Equal(addr1) || !bAddrs[1].Equal(addr2) {
+		t.Fatalf("merged addrs for %s = %v, want deduplicated union [%s %s]", pidB, bAddrs, addr1, addr2)
+	}
+}
+
+// a Failed answer counts toward the quorum but contributes nothing; the
+// other branch's list wins alone
+func TestFailedAnswerDoesNotBlockOtherBranch(t *testing.T) {
+	sender := &fakeSender{}
+	k, m := 2, 1
+	jm, _ := newTestJobManager(t, sender, jobSampleSize(k, m), JobConfig{Branches: k, ReturnPaths: m, Timeout: 10 * time.Second})
+
+	res, err := jm.StartJob(context.Background(), testCID(t))
+	if err != nil {
+		t.Fatalf("StartJob: %v", err)
+	}
+	ids := jm.pendingSURBIDs()
+
+	failed, err := EncodeReply(ReplyStatusFailed, nil)
+	if err != nil {
+		t.Fatalf("EncodeReply: %v", err)
+	}
+	jm.HandleSURBReply(ids[0], failed)
+	select {
+	case got := <-res:
+		t.Fatalf("failed answer settled the job alone: %+v", got)
+	default:
+	}
+
+	want := testProviders(t, 2)
+	payload, err := EncodeReply(ReplyStatusOK, want)
+	if err != nil {
+		t.Fatalf("EncodeReply: %v", err)
+	}
+	jm.HandleSURBReply(ids[1], payload)
+	got, ok := <-res
+	if !ok || got.Err != nil {
+		t.Fatalf("job settled with ok=%v err=%v, want the OK branch", ok, got.Err)
+	}
+	assertProvidersEqual(t, got.Providers, want)
+	met := jm.Metrics()
+	if met.RepliesFailed != 1 || met.JobsFailed != 0 || met.JobsSucceeded != 1 {
+		t.Errorf("counters = %d failed replies / %d failed / %d succeeded, want 1 / 0 / 1",
+			met.RepliesFailed, met.JobsFailed, met.JobsSucceeded)
+	}
+}
+
+// only unanimous Failed settles the job as a discovery failure
+func TestAllBranchesFailedSettlesFailed(t *testing.T) {
+	sender := &fakeSender{}
+	k, m := 2, 1
+	jm, surbs := newTestJobManager(t, sender, jobSampleSize(k, m), JobConfig{Branches: k, ReturnPaths: m, Timeout: 10 * time.Second})
+
+	res, err := jm.StartJob(context.Background(), testCID(t))
+	if err != nil {
+		t.Fatalf("StartJob: %v", err)
+	}
+	ids := jm.pendingSURBIDs()
+
+	failed, err := EncodeReply(ReplyStatusFailed, nil)
+	if err != nil {
+		t.Fatalf("EncodeReply: %v", err)
+	}
+	jm.HandleSURBReply(ids[0], failed)
+	jm.HandleSURBReply(ids[1], failed)
+
+	start := time.Now()
+	got := <-res
+	if !errors.Is(got.Err, ErrDiscoveryFailed) {
+		t.Fatalf("all-failed quorum settled with %v, want ErrDiscoveryFailed", got.Err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("all-failed quorum waited out the timer (%s)", elapsed)
+	}
+	met := jm.Metrics()
+	if met.RepliesFailed != 2 || met.JobsFailed != 1 {
+		t.Errorf("counters = %d failed replies / %d failed jobs, want 2 / 1", met.RepliesFailed, met.JobsFailed)
+	}
+	if jobs, surbIDs := jm.pendingCounts(); jobs != 0 || surbIDs != 0 {
+		t.Errorf("state after failed settle: %d jobs / %d surb ids", jobs, surbIDs)
+	}
+	if surbs.Len() != 0 {
+		t.Errorf("surb store holds %d entries after failed settle", surbs.Len())
+	}
+}
+
+// the proxy answers identically through all m envelopes; only the first
+// copy is the branch's answer
+func TestDuplicateCopiesFromSameBranchCountOnce(t *testing.T) {
+	sender := &fakeSender{}
+	k, m := 2, 2 // two SURBs per branch
+	jm, _ := newTestJobManager(t, sender, jobSampleSize(k, m), JobConfig{Branches: k, ReturnPaths: m, Timeout: 10 * time.Second})
+
+	res, err := jm.StartJob(context.Background(), testCID(t))
+	if err != nil {
+		t.Fatalf("StartJob: %v", err)
+	}
+	ids := jm.pendingSURBIDs()
+	if len(ids) != k*m {
+		t.Fatalf("job registered %d surb ids, want %d", len(ids), k*m)
+	}
+
+	failed, err := EncodeReply(ReplyStatusFailed, nil)
+	if err != nil {
+		t.Fatalf("EncodeReply: %v", err)
+	}
+	jm.HandleSURBReply(ids[0], failed)
+
+	// answering retired the whole branch: the sibling copy's mapping is
+	// gone and identifies the branch
+	remaining := make(map[SURBID]bool)
+	for _, sid := range jm.pendingSURBIDs() {
+		remaining[sid] = true
+	}
+	var sibling SURBID
+	found := false
+	for _, sid := range ids {
+		if sid != ids[0] && !remaining[sid] {
+			sibling, found = sid, true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("answering did not drop the branch's sibling surb mapping")
+	}
+
+	jm.HandleSURBReply(sibling, failed)
+	select {
+	case got := <-res:
+		t.Fatalf("duplicate copy settled the job: %+v", got)
+	default:
+	}
+	met := jm.Metrics()
+	if met.RepliesFailed != 1 || met.RepliesDuplicate != 1 || met.JobsFailed != 0 {
+		t.Errorf("counters = %d failed / %d duplicate / %d failed jobs, want 1 / 1 / 0",
+			met.RepliesFailed, met.RepliesDuplicate, met.JobsFailed)
+	}
+}
+
+// mergeAnswers is pure: rank by distinct-branch confirmations, ties in
+// arrival order, per-list duplicates count once, addresses dedupe
+func TestMergeAnswers(t *testing.T) {
+	_, pidA := newIdentity(t)
+	_, pidB := newIdentity(t)
+	_, pidC := newIdentity(t)
+	addr1 := ma.StringCast("/ip4/10.0.0.1/tcp/4001")
+	addr2 := ma.StringCast("/ip4/10.0.0.2/tcp/4001")
+
+	got := mergeAnswers([][]peer.AddrInfo{
+		// pidA twice in one list must count as one confirmation
+		{{ID: pidA, Addrs: []ma.Multiaddr{addr1}}, {ID: pidA, Addrs: []ma.Multiaddr{addr1, addr2}}, {ID: pidB}},
+		{{ID: pidC}, {ID: pidB}},
+	})
+	if len(got) != 3 {
+		t.Fatalf("merged %d providers, want 3: %v", len(got), got)
+	}
+	if got[0].ID != pidB || got[1].ID != pidA || got[2].ID != pidC {
+		t.Fatalf("merged order %v, want [%s %s %s]", got, pidB, pidA, pidC)
+	}
+	if len(got[1].Addrs) != 2 || !got[1].Addrs[0].Equal(addr1) || !got[1].Addrs[1].Equal(addr2) {
+		t.Fatalf("addrs for %s = %v, want deduplicated [%s %s]", pidA, got[1].Addrs, addr1, addr2)
+	}
+
+	single := []peer.AddrInfo{{ID: pidA}}
+	if got := mergeAnswers([][]peer.AddrInfo{single}); len(got) != 1 || got[0].ID != pidA {
+		t.Fatalf("single-list merge changed the list: %v", got)
+	}
+}
+
 func TestUndecodableReplyDiscardsOnlyThatBranch(t *testing.T) {
 	sender := &fakeSender{}
 	k, m := 2, 1 // one SURB per branch: the garbage reply names one branch
@@ -631,6 +909,39 @@ func TestStartJobFailsOnSmallPool(t *testing.T) {
 	}
 }
 
+func TestStartJobRefusedInClientMode(t *testing.T) {
+	sender := &fakeSender{}
+	k, m := DefaultBranchesPerJob, ReturnPathsPerJob
+	// full pool, so only the serving gate can refuse the start
+	jm, surbs := newTestJobManager(t, sender, jobSampleSize(k, m), JobConfig{ServingCheck: func() bool { return false }})
+
+	if _, err := jm.StartJob(context.Background(), testCID(t)); !errors.Is(err, ErrClientMode) {
+		t.Fatalf("StartJob in client mode: err = %v, want ErrClientMode", err)
+	}
+	if len(sender.snapshot()) != 0 {
+		t.Error("a refused job start sent packets")
+	}
+	if jobs, surbIDs := jm.pendingCounts(); jobs != 0 || surbIDs != 0 {
+		t.Errorf("refused start left state: %d jobs / %d surb ids", jobs, surbIDs)
+	}
+	if surbs.Len() != 0 {
+		t.Errorf("surb store holds %d entries after a refused start", surbs.Len())
+	}
+}
+
+func TestStartJobAllowedWhenServing(t *testing.T) {
+	sender := &fakeSender{}
+	k, m := DefaultBranchesPerJob, ReturnPathsPerJob
+	jm, _ := newTestJobManager(t, sender, jobSampleSize(k, m), JobConfig{ServingCheck: func() bool { return true }})
+
+	if _, err := jm.StartJob(context.Background(), testCID(t)); err != nil {
+		t.Fatalf("StartJob while serving: %v", err)
+	}
+	if got := len(sender.snapshot()); got != k {
+		t.Fatalf("serving start sent %d packets, want k = %d", got, k)
+	}
+}
+
 func TestStartJobAllBranchSendsFailCleansUp(t *testing.T) {
 	sender := &fakeSender{err: errors.New("dial refused")}
 	k, m := 2, ReturnPathsPerJob
@@ -653,8 +964,8 @@ func TestStartJobAllBranchSendsFailCleansUp(t *testing.T) {
 
 func TestCountersHappyPath(t *testing.T) {
 	sender := &fakeSender{}
-	k, m := DefaultBranchesPerJob, ReturnPathsPerJob
-	jm, _ := newTestJobManager(t, sender, jobSampleSize(k, m), JobConfig{})
+	k, m := DefaultBranchesPerJob, 1 // one SURB per branch: ids map to branches
+	jm, _ := newTestJobManager(t, sender, jobSampleSize(k, m), JobConfig{ReturnPaths: m})
 
 	res, err := jm.StartJob(context.Background(), testCID(t))
 	if err != nil {
@@ -666,15 +977,16 @@ func TestCountersHappyPath(t *testing.T) {
 		t.Fatalf("EncodeReply: %v", err)
 	}
 	jm.HandleSURBReply(ids[0], payload)
+	jm.HandleSURBReply(ids[1], payload) // second branch completes the quorum
 	if got := <-res; got.Err != nil {
 		t.Fatalf("job settled with error: %v", got.Err)
 	}
-	jm.HandleSURBReply(ids[1], payload) // cross-branch duplicate
+	jm.HandleSURBReply(ids[0], payload) // after the settle: duplicate
 
 	want := JobMetricsSnapshot{
 		JobsStarted:       1,
 		BranchPacketsSent: uint64(k),
-		RepliesWon:        1,
+		RepliesCollected:  uint64(k),
 		RepliesDuplicate:  1,
 		JobsSucceeded:     1,
 		ProxyCPLCount:     uint64(k),
@@ -876,6 +1188,464 @@ func assertDrawDistinct(t *testing.T, draw []KeyInfo) {
 			t.Errorf("draw holds %s twice", ki.PeerID)
 		}
 		seen[ki.PeerID] = struct{}{}
+	}
+}
+
+// --- initiator-edge connection bias ---
+
+// mapPeerState serves Connectedness and Addrs from fixed maps; an unknown
+// peer reads as NotConnected (zero value) with no addresses
+type mapPeerState struct {
+	conn  map[peer.ID]network.Connectedness
+	addrs map[peer.ID][]ma.Multiaddr
+}
+
+func (m mapPeerState) Connectedness(p peer.ID) network.Connectedness { return m.conn[p] }
+func (m mapPeerState) Addrs(p peer.ID) []ma.Multiaddr                { return m.addrs[p] }
+
+// newEdgeManager builds a JobManager with no pool (biasEdgeSlots reads only
+// k, m, PeerState and the draw), so unit tests can drive biasEdgeSlots on a
+// hand-built draw
+func newEdgeManager(t *testing.T, k, m int, eps float64, state PeerState) *JobManager {
+	t.Helper()
+	idPriv, _ := newIdentity(t)
+	km, err := NewKeyManager(idPriv, time.Hour)
+	if err != nil {
+		t.Fatalf("NewKeyManager: %v", err)
+	}
+	jm, err := NewJobManager(&fakeSender{}, km, NewKeyStore(), NewSURBStore(),
+		JobConfig{Branches: k, ReturnPaths: m, InitiatorEdgeEpsilon: eps, PeerState: state})
+	if err != nil {
+		t.Fatalf("NewJobManager: %v", err)
+	}
+	return jm
+}
+
+// edgeSlotClasses replicates biasEdgeSlots' index math so tests can assert
+// against real slot coordinates
+func edgeSlotClasses(k, m int) (r1, surbLast, nonSensitive, proxy []int) {
+	g := NrHops + 2*m
+	for bi := range k {
+		base := bi * g
+		r1 = append(r1, base)
+		for j := 1; j < NrHops-1; j++ {
+			nonSensitive = append(nonSensitive, base+j)
+		}
+		proxy = append(proxy, base+NrHops-1)
+		for i := range m {
+			nonSensitive = append(nonSensitive, base+NrHops+2*i)
+			surbLast = append(surbLast, base+NrHops+2*i+1)
+		}
+	}
+	return
+}
+
+// buildEdgeDraw makes a draw of jm.sampleSize() distinct peers and a state
+// marking exactly nConn of the non-proxy-slot peers connected. addrsFor, if
+// non-nil, decides a peer's peerstore addresses by its draw index
+func buildEdgeDraw(t *testing.T, jm *JobManager, nConn int, addrsFor func(idx int) []ma.Multiaddr) ([]KeyInfo, mapPeerState) {
+	t.Helper()
+	size := jm.sampleSize()
+	_, _, nonSensitive, proxy := edgeSlotClasses(jm.k, jm.m)
+	isProxy := make(map[int]bool, len(proxy))
+	for _, idx := range proxy {
+		isProxy[idx] = true
+	}
+	_ = nonSensitive
+
+	draw := make([]KeyInfo, size)
+	state := mapPeerState{
+		conn:  make(map[peer.ID]network.Connectedness, size),
+		addrs: make(map[peer.ID][]ma.Multiaddr, size),
+	}
+	assigned := 0
+	for i := range draw {
+		_, pid := newIdentity(t)
+		draw[i] = KeyInfo{PeerID: pid}
+		if !isProxy[i] && assigned < nConn {
+			state.conn[pid] = network.Connected
+			assigned++
+		}
+		if addrsFor != nil {
+			state.addrs[pid] = addrsFor(i)
+		}
+	}
+	if assigned < nConn {
+		t.Fatalf("wanted %d connected non-proxy peers, only %d non-proxy slots", nConn, assigned)
+	}
+	return draw, state
+}
+
+func countConnected(state mapPeerState, draw []KeyInfo, slots []int) (conn int) {
+	for _, idx := range slots {
+		if state.conn[draw[idx].PeerID] == network.Connected {
+			conn++
+		}
+	}
+	return conn
+}
+
+func peerIDsAt(draw []KeyInfo, slots []int) []peer.ID {
+	out := make([]peer.ID, len(slots))
+	for i, idx := range slots {
+		out[i] = draw[idx].PeerID
+	}
+	return out
+}
+
+func TestBiasEdgeEpsilonZeroPrefersUnconnectedOnAllSensitiveSlots(t *testing.T) {
+	k, m := 2, 3
+	jm := newEdgeManager(t, k, m, 0, nil)
+	r1, surbLast, _, proxy := edgeSlotClasses(k, m)
+	// enough unconnected peers to cover every sensitive slot: non-proxy
+	// count is sampleSize - len(proxy); make only a few connected
+	draw, state := buildEdgeDraw(t, jm, 4, nil)
+	jm.state = state
+	proxyBefore := peerIDsAt(draw, proxy)
+
+	jm.biasEdgeSlots(draw)
+
+	if c := countConnected(state, draw, r1); c != 0 {
+		t.Errorf("R1 slots connected = %d, want 0 at epsilon 0 with free peers available", c)
+	}
+	if c := countConnected(state, draw, surbLast); c != 0 {
+		t.Errorf("SURB-last slots connected = %d, want 0 at epsilon 0 with free peers available", c)
+	}
+	for i, idx := range proxy {
+		if draw[idx].PeerID != proxyBefore[i] {
+			t.Errorf("proxy slot %d changed: %s -> %s", idx, proxyBefore[i], draw[idx].PeerID)
+		}
+	}
+	assertDrawDistinct(t, draw)
+}
+
+func TestBiasEdgeEpsilonOnePrefersConnectedOnAllSensitiveSlots(t *testing.T) {
+	k, m := 2, 3
+	jm := newEdgeManager(t, k, m, 1, nil)
+	r1, surbLast, nonSensitive, _ := edgeSlotClasses(k, m)
+	sensitive := len(r1) + len(surbLast)
+	// enough connected peers to cover every sensitive slot
+	draw, state := buildEdgeDraw(t, jm, sensitive+len(nonSensitive)-2, nil)
+	jm.state = state
+
+	jm.biasEdgeSlots(draw)
+
+	if c := countConnected(state, draw, r1); c != len(r1) {
+		t.Errorf("R1 slots connected = %d, want %d at epsilon 1", c, len(r1))
+	}
+	if c := countConnected(state, draw, surbLast); c != len(surbLast) {
+		t.Errorf("SURB-last slots connected = %d, want %d at epsilon 1", c, len(surbLast))
+	}
+	assertDrawDistinct(t, draw)
+}
+
+func TestBiasEdgeConnectedParkedOnNonSensitiveOnly(t *testing.T) {
+	k, m := 2, 3
+	jm := newEdgeManager(t, k, m, 0, nil)
+	r1, surbLast, nonSensitive, _ := edgeSlotClasses(k, m)
+	// exactly as many connected peers as non-sensitive slots, the rest
+	// unconnected: at epsilon 0 every sensitive slot takes a free peer, so
+	// every connected peer must end on a non-sensitive slot
+	draw, state := buildEdgeDraw(t, jm, len(nonSensitive), nil)
+	jm.state = state
+
+	jm.biasEdgeSlots(draw)
+
+	if c := countConnected(state, draw, r1); c != 0 {
+		t.Errorf("R1 slots connected = %d, want 0", c)
+	}
+	if c := countConnected(state, draw, surbLast); c != 0 {
+		t.Errorf("SURB-last slots connected = %d, want 0", c)
+	}
+	if c := countConnected(state, draw, nonSensitive); c != len(nonSensitive) {
+		t.Errorf("non-sensitive slots connected = %d, want all %d (connected peers parked here)", c, len(nonSensitive))
+	}
+	assertDrawDistinct(t, draw)
+}
+
+func TestBiasEdgeEpsilonHalfFollowsCoin(t *testing.T) {
+	k, m := 1, 1
+	jm := newEdgeManager(t, k, m, 0.5, nil)
+	r1, surbLast, _, proxy := edgeSlotClasses(k, m)
+	sensitive := append(append([]int{}, r1...), surbLast...) // {0, 4}
+	// two connected + two unconnected among the four non-proxy slots keeps
+	// both pools non-empty across both sensitive assignments, so each coin
+	// decides freely
+	draw, state := buildEdgeDraw(t, jm, 2, nil)
+	jm.state = state
+	proxyBefore := peerIDsAt(draw, proxy)
+
+	// script the seam: identity shuffles (return n-1 so Fisher-Yates
+	// no-ops), coin true for the first sensitive slot, false for the second
+	coins := []bool{true, false}
+	ci := 0
+	jm.rand = func(n int) int {
+		if n == 1<<30 {
+			v := 1<<30 - 1 // >= threshold: wantConnected false
+			if coins[ci] {
+				v = 0 // < threshold: wantConnected true
+			}
+			ci++
+			return v
+		}
+		return n - 1 // identity shuffle
+	}
+
+	jm.biasEdgeSlots(draw)
+
+	// identity shuffles keep the sensitive processing order = {0, 4}
+	if got := state.conn[draw[sensitive[0]].PeerID] == network.Connected; got != coins[0] {
+		t.Errorf("sensitive slot %d connected = %v, want %v (coin)", sensitive[0], got, coins[0])
+	}
+	if got := state.conn[draw[sensitive[1]].PeerID] == network.Connected; got != coins[1] {
+		t.Errorf("sensitive slot %d connected = %v, want %v (coin)", sensitive[1], got, coins[1])
+	}
+	for i, idx := range proxy {
+		if draw[idx].PeerID != proxyBefore[i] {
+			t.Errorf("proxy slot %d changed", idx)
+		}
+	}
+	assertDrawDistinct(t, draw)
+}
+
+func TestBiasEdgeUnconnectedExhaustionFallsBack(t *testing.T) {
+	k, m := 2, 3
+	jm := newEdgeManager(t, k, m, 0, nil)
+	r1, surbLast, _, _ := edgeSlotClasses(k, m)
+	sensitiveCount := len(r1) + len(surbLast)
+	free := 3 // fewer than the sensitive-slot count
+	nonProxy := jm.sampleSize() - k
+	draw, state := buildEdgeDraw(t, jm, nonProxy-free, nil)
+	jm.state = state
+
+	jm.biasEdgeSlots(draw)
+
+	sensSlots := append(append([]int{}, r1...), surbLast...)
+	if c := countConnected(state, draw, sensSlots); c != sensitiveCount-free {
+		t.Errorf("connected on sensitive slots = %d, want %d (only %d free peers to place)", c, sensitiveCount-free, free)
+	}
+	assertDrawDistinct(t, draw)
+}
+
+func TestBiasEdgeConnectedExhaustionFallsBack(t *testing.T) {
+	k, m := 2, 3
+	jm := newEdgeManager(t, k, m, 1, nil)
+	r1, surbLast, _, _ := edgeSlotClasses(k, m)
+	conn := 3 // fewer than the sensitive-slot count
+	draw, state := buildEdgeDraw(t, jm, conn, nil)
+	jm.state = state
+
+	jm.biasEdgeSlots(draw)
+
+	sensSlots := append(append([]int{}, r1...), surbLast...)
+	if c := countConnected(state, draw, sensSlots); c != conn {
+		t.Errorf("connected on sensitive slots = %d, want %d (only %d connected peers)", c, conn, conn)
+	}
+	assertDrawDistinct(t, draw)
+}
+
+// under class scarcity the shortfall must spread across BOTH sensitive
+// classes via the shuffled processing order, not land systematically on
+// R1 because it is listed first
+func TestBiasEdgeExhaustionSpreadsAcrossClasses(t *testing.T) {
+	k, m := 1, 3
+	r1, surbLast, _, _ := edgeSlotClasses(k, m) // r1 = {0}, surbLast = {4,6,8}
+	freeOnR1, freeOnSurb := 0, 0
+	for range 200 {
+		jm := newEdgeManager(t, k, m, 0, nil)
+		nonProxy := jm.sampleSize() - k
+		// exactly one free peer: at epsilon 0 it goes to whichever
+		// sensitive slot is processed first
+		draw, state := buildEdgeDraw(t, jm, nonProxy-1, nil)
+		jm.state = state
+		jm.biasEdgeSlots(draw)
+		if state.conn[draw[r1[0]].PeerID] != network.Connected {
+			freeOnR1++
+		}
+		for _, idx := range surbLast {
+			if state.conn[draw[idx].PeerID] != network.Connected {
+				freeOnSurb++
+			}
+		}
+	}
+	if freeOnR1 == 0 {
+		t.Error("the scarce free peer never landed on the R1 slot: processing order is not shuffled across classes")
+	}
+	if freeOnSurb == 0 {
+		t.Error("the scarce free peer never landed on a SURB-last slot: processing order is not shuffled across classes")
+	}
+}
+
+func TestBiasEdgeDisabledSentinel(t *testing.T) {
+	k, m := 2, 3
+	jm := newEdgeManager(t, k, m, -1, nil)
+	r1, surbLast, _, _ := edgeSlotClasses(k, m)
+	draw, state := buildEdgeDraw(t, jm, 5, nil)
+	jm.state = state
+	before := append([]KeyInfo(nil), draw...)
+	wantR1Conn := countConnected(state, draw, r1)
+	wantSurbConn := countConnected(state, draw, surbLast)
+
+	jm.biasEdgeSlots(draw)
+
+	for i := range draw {
+		if draw[i].PeerID != before[i].PeerID {
+			t.Fatalf("disabled bias reordered slot %d: %s -> %s", i, before[i].PeerID, draw[i].PeerID)
+		}
+	}
+	met := jm.Metrics()
+	if met.FirstHopConnected != uint64(wantR1Conn) || met.FirstHopUnconnected != uint64(len(r1)-wantR1Conn) {
+		t.Errorf("R1 diagnostics = %d conn / %d unconn, want %d / %d", met.FirstHopConnected, met.FirstHopUnconnected, wantR1Conn, len(r1)-wantR1Conn)
+	}
+	if met.SurbLastConnected != uint64(wantSurbConn) || met.SurbLastUnconnected != uint64(len(surbLast)-wantSurbConn) {
+		t.Errorf("SURB-last diagnostics = %d conn / %d unconn, want %d / %d", met.SurbLastConnected, met.SurbLastUnconnected, wantSurbConn, len(surbLast)-wantSurbConn)
+	}
+}
+
+func TestBiasEdgeNilStateIsInert(t *testing.T) {
+	k, m := 2, 3
+	jm := newEdgeManager(t, k, m, 0, nil) // PeerState nil
+	draw, _ := buildEdgeDraw(t, jm, 5, nil)
+	before := append([]KeyInfo(nil), draw...)
+
+	jm.biasEdgeSlots(draw)
+
+	for i := range draw {
+		if draw[i].PeerID != before[i].PeerID {
+			t.Fatalf("nil PeerState reordered slot %d", i)
+		}
+	}
+	met := jm.Metrics()
+	if met.FirstHopConnected|met.FirstHopUnconnected|met.FirstHopWithAddrs|met.FirstHopWithoutAddrs|met.SurbLastConnected|met.SurbLastUnconnected != 0 {
+		t.Errorf("nil PeerState recorded diagnostics: %+v", met)
+	}
+}
+
+func TestBiasEdgeAddrDiagnosticFirstHopOnly(t *testing.T) {
+	k, m := 1, 3
+	jm := newEdgeManager(t, k, m, 0, nil)
+	testAddr := ma.StringCast("/ip4/1.2.3.4/tcp/4001")
+	// connected peers carry an address, unconnected peers carry none: at
+	// epsilon 0 the first hop ends unconnected (and thus address-less),
+	// proving the address does not gate selection
+	addrsFor := func(idx int) []ma.Multiaddr { return nil }
+	draw, state := buildEdgeDraw(t, jm, 4, addrsFor)
+	// give every connected peer an address
+	for pid, c := range state.conn {
+		if c == network.Connected {
+			state.addrs[pid] = []ma.Multiaddr{testAddr}
+		}
+	}
+	jm.state = state
+
+	jm.biasEdgeSlots(draw)
+
+	met := jm.Metrics()
+	if met.FirstHopWithAddrs != 0 || met.FirstHopWithoutAddrs != uint64(k) {
+		t.Errorf("first-hop addr diagnostics = %d with / %d without, want 0 / %d", met.FirstHopWithAddrs, met.FirstHopWithoutAddrs, k)
+	}
+	r1, _, _, _ := edgeSlotClasses(k, m)
+	if state.conn[draw[r1[0]].PeerID] == network.Connected {
+		t.Error("first hop is connected: address-less unconnected peer should have won at epsilon 0")
+	}
+}
+
+func TestBiasEdgeAppliesOnRetransmit(t *testing.T) {
+	sender := &fakeSender{}
+	k, m := 1, 3
+	// empty state: every pool peer reads NotConnected, so the bias is inert
+	// but the diagnostics still fire once per attempt
+	state := mapPeerState{conn: map[peer.ID]network.Connectedness{}}
+	jm, _ := newTestJobManager(t, sender, jobSampleSize(k, m),
+		JobConfig{Branches: k, ReturnPaths: m, Timeout: 100 * time.Millisecond, PeerState: state})
+
+	res, err := jm.StartJob(context.Background(), testCID(t))
+	if err != nil {
+		t.Fatalf("StartJob: %v", err)
+	}
+	select {
+	case got := <-res:
+		if !errors.Is(got.Err, ErrJobTimeout) {
+			t.Fatalf("job settled with %v, want ErrJobTimeout", got.Err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("job never timed out")
+	}
+
+	met := jm.Metrics()
+	if got := met.FirstHopConnected + met.FirstHopUnconnected; got != 2 {
+		t.Errorf("first-hop diagnostics over two attempts = %d, want 2", got)
+	}
+	if got := met.SurbLastConnected + met.SurbLastUnconnected; got != uint64(2*m) {
+		t.Errorf("SURB-last diagnostics over two attempts = %d, want 2·m = %d", got, 2*m)
+	}
+}
+
+func TestBiasEdgePreservesDisjointness(t *testing.T) {
+	sender := &fakeSender{}
+	k, m := 2, ReturnPathsPerJob
+	need := jobSampleSize(k, m)
+	// half the pool connected, so the bias actively reorders
+	state := mapPeerState{conn: map[peer.ID]network.Connectedness{}}
+	jm, _ := newTestJobManager(t, sender, need, JobConfig{Branches: k, InitiatorEdgeEpsilon: 0.5, PeerState: state})
+	// mark a subset of the pool connected
+	for i, ki := range jm.pool.Sample(jm.pool.Len()) {
+		if i%2 == 0 {
+			state.conn[ki.PeerID] = network.Connected
+		}
+	}
+
+	if _, err := jm.StartJob(context.Background(), testCID(t)); err != nil {
+		t.Fatalf("StartJob: %v", err)
+	}
+	if relays := jm.pendingJobRelays(t); len(relays) != need {
+		t.Errorf("job drew %d distinct relays under bias, want %d (fully disjoint)", len(relays), need)
+	}
+}
+
+func TestBiasEdgeDiagnosticCounts(t *testing.T) {
+	sender := &fakeSender{}
+	k, m := 3, 3
+	state := mapPeerState{conn: map[peer.ID]network.Connectedness{}}
+	jm, _ := newTestJobManager(t, sender, jobSampleSize(k, m),
+		JobConfig{Branches: k, ReturnPaths: m, Timeout: 10 * time.Second, PeerState: state})
+
+	if _, err := jm.StartJob(context.Background(), testCID(t)); err != nil {
+		t.Fatalf("StartJob: %v", err)
+	}
+	met := jm.Metrics()
+	if got := met.FirstHopConnected + met.FirstHopUnconnected; got != uint64(k) {
+		t.Errorf("first-hop diagnostics = %d, want k = %d", got, k)
+	}
+	if got := met.SurbLastConnected + met.SurbLastUnconnected; got != uint64(k*m) {
+		t.Errorf("SURB-last diagnostics = %d, want k·m = %d", got, k*m)
+	}
+	if got := met.FirstHopWithAddrs + met.FirstHopWithoutAddrs; got != uint64(k) {
+		t.Errorf("first-hop addr diagnostics = %d, want k = %d", got, k)
+	}
+}
+
+func TestNewJobManagerRejectsEpsilonAboveOne(t *testing.T) {
+	idPriv, _ := newIdentity(t)
+	km, err := NewKeyManager(idPriv, time.Hour)
+	if err != nil {
+		t.Fatalf("NewKeyManager: %v", err)
+	}
+	if _, err := NewJobManager(&fakeSender{}, km, NewKeyStore(), NewSURBStore(), JobConfig{InitiatorEdgeEpsilon: 1.01}); err == nil {
+		t.Fatal("NewJobManager accepted InitiatorEdgeEpsilon > 1")
+	}
+}
+
+func TestNewJobManagerAcceptsEpsilonBoundsAndSentinel(t *testing.T) {
+	idPriv, _ := newIdentity(t)
+	km, err := NewKeyManager(idPriv, time.Hour)
+	if err != nil {
+		t.Fatalf("NewKeyManager: %v", err)
+	}
+	for _, eps := range []float64{-1, 0, 0.5, 1} {
+		if _, err := NewJobManager(&fakeSender{}, km, NewKeyStore(), NewSURBStore(), JobConfig{InitiatorEdgeEpsilon: eps}); err != nil {
+			t.Errorf("NewJobManager rejected InitiatorEdgeEpsilon = %v: %v", eps, err)
+		}
 	}
 }
 

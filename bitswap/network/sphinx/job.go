@@ -46,7 +46,7 @@ const (
 	// identity-embedded ed25519 peer ID: 38 B, hashed (RSA etc.): 34 B
 	MaxPeerIDLen = 42
 
-	// one dialable addr suffices, the second covers a another transport;
+	// one dialable addr suffices, the second covers another transport;
 	// the initiator learns the rest via identify
 	MaxAddrsPerProvider = 2
 

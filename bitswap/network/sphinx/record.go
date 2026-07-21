@@ -22,8 +22,8 @@ func init() {
 // signature domain; prevents signature replay across record types
 const KeyRecordEnvelopeDomain = "sphinx-key-record"
 
-// payload type hint inside the envelope, "Sp"
-var KeyRecordEnvelopePayloadType = []byte{0x53, 0x70}
+// payload type hint inside the envelope
+var KeyRecordEnvelopePayloadType = []byte("Sp")
 
 // KeyRecord binds a peer identity to its X25519 Sphinx key, with a
 // strictly increasing Seq and an absolute expiry. Travels in a

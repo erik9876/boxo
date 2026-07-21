@@ -37,8 +37,9 @@ type PeerFinder interface {
 
 // Transport wires a Relay to a libp2p host. One packet per stream,
 // fire-and-forget; replies come back later on a fresh stream the return
-// path opens. Every node runs the inbound handler, which is also how an
-// initiator receives its own SURB replies.
+// path opens. Serving nodes run the inbound handler, which is also how an
+// initiator (always a relay-set member) receives its own SURB replies; a
+// client-mode node keeps it unmounted (setServing).
 //
 // With a finder, every send is preceded by one FindPeer for the next hop,
 // known or not. All roles send through here, so initiator, relay and proxy
@@ -54,6 +55,9 @@ type Transport struct {
 
 	mu     sync.Mutex
 	closed bool
+	// tracks the relay handler so setServing is idempotent; NewTransport
+	// starts it mounted, NewService then drives it from the serving state
+	mounted bool
 }
 
 // NewTransport registers the relay handler on h. finder may be nil: sends
@@ -64,9 +68,28 @@ func NewTransport(h host.Host, relay *Relay, finder PeerFinder) *Transport {
 		relay:     relay,
 		finder:    finder,
 		packetLen: relay.geo.PacketLength,
+		mounted:   true,
 	}
 	h.SetStreamHandler(ProtocolRelay, t.handleStream)
 	return t
+}
+
+// setServing mounts or removes the relay handler to follow the node's
+// serving state, so a client-mode node advertises no sphinx protocol at
+// all. Idempotent and a no-op after Close; NewService drives it from the
+// key exchange
+func (t *Transport) setServing(on bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed || on == t.mounted {
+		return
+	}
+	t.mounted = on
+	if on {
+		t.host.SetStreamHandler(ProtocolRelay, t.handleStream)
+	} else {
+		t.host.RemoveStreamHandler(ProtocolRelay)
+	}
 }
 
 func (t *Transport) Metrics() TransportMetricsSnapshot {
@@ -82,6 +105,7 @@ func (t *Transport) Close() error {
 		return nil
 	}
 	t.closed = true
+	t.mounted = false
 	t.mu.Unlock()
 
 	t.host.RemoveStreamHandler(ProtocolRelay)
