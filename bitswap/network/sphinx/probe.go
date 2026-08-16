@@ -54,6 +54,10 @@ func (h HostNeighbors) Addrs(p peer.ID) []ma.Multiaddr { return h.Host.Peerstore
 type ProbeConfig struct {
 	// zero means DefaultProbeWindow
 	Window time.Duration
+	// Observer, when set, hears every completed Probe call: whether it
+	// hit, when the first HAVE arrived (zero without a hit) and how many
+	// distinct responders answered. Evaluation seam; nil disables it
+	Observer func(c cid.Cid, hit bool, start, firstHave time.Time, responders int)
 }
 
 // WantHaveProber runs the neighbor half of a proxy's provider discovery:
@@ -66,6 +70,7 @@ type WantHaveProber struct {
 	sender    WantSender
 	neighbors NeighborSource
 	window    time.Duration
+	observer  func(c cid.Cid, hit bool, start, firstHave time.Time, responders int)
 
 	mu sync.Mutex
 	// pending probes per CID; concurrent probes for one CID each get
@@ -79,6 +84,8 @@ type probeWatch struct {
 	seen  map[peer.ID]struct{}
 	// responders in arrival order; the limit caps it
 	order []peer.ID
+	// when the first responder arrived; zero until then
+	firstAt time.Time
 	// closed when the limit is reached
 	full chan struct{}
 }
@@ -91,6 +98,7 @@ func NewWantHaveProber(sender WantSender, neighbors NeighborSource, cfg ProbeCon
 		sender:    sender,
 		neighbors: neighbors,
 		window:    cfg.Window,
+		observer:  cfg.Observer,
 		watches:   make(map[cid.Cid][]*probeWatch),
 	}
 }
@@ -102,6 +110,7 @@ func NewWantHaveProber(sender WantSender, neighbors NeighborSource, cfg ProbeCon
 // are dialable without a lookup. An empty result is normal: the caller
 // decides about a fallback
 func (p *WantHaveProber) Probe(ctx context.Context, c cid.Cid, limit int) []peer.AddrInfo {
+	start := time.Now()
 	if limit <= 0 {
 		return nil
 	}
@@ -144,12 +153,18 @@ func (p *WantHaveProber) Probe(ctx context.Context, c cid.Cid, limit int) []peer
 	p.broadcast(context.Background(), neighbors, cancelMsg)
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if len(w.order) == 0 {
+	order := append([]peer.ID(nil), w.order...)
+	firstAt := w.firstAt
+	p.mu.Unlock()
+
+	if p.observer != nil {
+		p.observer(c, len(order) > 0, start, firstAt, len(order))
+	}
+	if len(order) == 0 {
 		return nil
 	}
-	providers := make([]peer.AddrInfo, 0, len(w.order))
-	for _, pid := range w.order {
+	providers := make([]peer.AddrInfo, 0, len(order))
+	for _, pid := range order {
 		providers = append(providers, peer.AddrInfo{ID: pid, Addrs: p.neighbors.Addrs(pid)})
 	}
 	return providers
@@ -219,6 +234,9 @@ func (w *probeWatch) record(sender peer.ID) {
 		return
 	}
 	w.seen[sender] = struct{}{}
+	if len(w.order) == 0 {
+		w.firstAt = time.Now()
+	}
 	w.order = append(w.order, sender)
 	if len(w.order) == w.limit {
 		close(w.full)

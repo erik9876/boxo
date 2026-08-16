@@ -317,3 +317,77 @@ func TestProbeThenRoutePropagatesRouteError(t *testing.T) {
 		t.Fatal("routing error was swallowed")
 	}
 }
+
+type probeObservation struct {
+	c          cid.Cid
+	hit        bool
+	start      time.Time
+	firstHave  time.Time
+	responders int
+}
+
+func TestProbeObserverReportsFirstHave(t *testing.T) {
+	c := testCID(t)
+	peers := probePeers(t, 3)
+	var obs []probeObservation
+	var obsMu sync.Mutex
+	p := NewWantHaveProber(&fakeWantSender{}, fakeNeighbors{peers: peers}, ProbeConfig{
+		Window: time.Second,
+		Observer: func(c cid.Cid, hit bool, start, firstHave time.Time, responders int) {
+			obsMu.Lock()
+			defer obsMu.Unlock()
+			obs = append(obs, probeObservation{c, hit, start, firstHave, responders})
+		},
+	})
+
+	before := time.Now()
+	done := make(chan []peer.AddrInfo, 1)
+	go func() { done <- p.Probe(context.Background(), c, 1) }()
+
+	waitUntil(t, time.Second, func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return len(p.watches[c]) == 1
+	}, "probe never registered its watch")
+	p.ReceiveMessage(context.Background(), peers[0], haveMsg(c))
+	<-done
+
+	obsMu.Lock()
+	defer obsMu.Unlock()
+	if len(obs) != 1 {
+		t.Fatalf("observer called %d times, want 1", len(obs))
+	}
+	o := obs[0]
+	if !o.hit || o.responders != 1 {
+		t.Errorf("observation hit=%t responders=%d, want true/1", o.hit, o.responders)
+	}
+	if o.firstHave.IsZero() || o.firstHave.Before(before) || o.firstHave.Before(o.start) {
+		t.Errorf("first-have time %v implausible (start %v)", o.firstHave, o.start)
+	}
+}
+
+func TestProbeObserverReportsMiss(t *testing.T) {
+	c := testCID(t)
+	var obs []probeObservation
+	var obsMu sync.Mutex
+	p := NewWantHaveProber(&fakeWantSender{}, fakeNeighbors{peers: probePeers(t, 2)}, ProbeConfig{
+		Window: 30 * time.Millisecond,
+		Observer: func(c cid.Cid, hit bool, start, firstHave time.Time, responders int) {
+			obsMu.Lock()
+			defer obsMu.Unlock()
+			obs = append(obs, probeObservation{c, hit, start, firstHave, responders})
+		},
+	})
+
+	if got := p.Probe(context.Background(), c, 4); got != nil {
+		t.Fatalf("empty probe returned %v", got)
+	}
+	obsMu.Lock()
+	defer obsMu.Unlock()
+	if len(obs) != 1 {
+		t.Fatalf("observer called %d times, want 1", len(obs))
+	}
+	if obs[0].hit || !obs[0].firstHave.IsZero() || obs[0].responders != 0 {
+		t.Errorf("miss observation = %+v, want hit=false, zero first-have, 0 responders", obs[0])
+	}
+}

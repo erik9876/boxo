@@ -91,6 +91,9 @@ type JobConfig struct {
 	// disables the gate, the ungated default for direct callers and tests;
 	// NewService fills it from the key exchange
 	ServingCheck func() bool
+	// Observer receives attempt, branch and settle events of every job;
+	// nil disables the seam. Evaluation lever only
+	Observer JobObserver
 }
 
 // PeerState reads selection-time facts about relay candidates: connection
@@ -123,6 +126,7 @@ type JobManager struct {
 	serving func() bool
 	// crypto/rand by default; tests script it
 	rand func(int) int
+	obs  JobObserver
 
 	metrics JobMetrics
 
@@ -218,6 +222,7 @@ func NewJobManager(sender PacketSender, km *KeyManager, pool *KeyStore, surbs *S
 		epsilon:      cfg.InitiatorEdgeEpsilon,
 		state:        cfg.PeerState,
 		serving:      cfg.ServingCheck,
+		obs:          cfg.Observer,
 		rand:         randIntn,
 		jobs:         make(map[uint64]*discoveryJob),
 		bySURB:       make(map[SURBID]uint64),
@@ -290,18 +295,25 @@ func (jm *JobManager) StartJob(ctx context.Context, c cid.Cid) (<-chan JobResult
 	jm.registerAttemptLocked(j, draw, branches)
 	jm.mu.Unlock()
 
+	jm.observeAttempt(j.id, c, 1, draw)
 	jm.metrics.JobsStarted.Add(1)
 	sent := 0
-	for _, b := range branches {
+	var dead []int
+	for bi, b := range branches {
 		if jm.sendBranch(ctx, b) {
 			sent++
+		} else {
+			dead = append(dead, bi)
 		}
+	}
+	for _, bi := range dead {
+		jm.observeBranch(j.id, 1, bi, BranchDeadSend)
 	}
 	// dead branches leave the quorum; a first attempt with every branch
 	// dead retries through the same path as one whose branches all
 	// answered Failed
-	if dead := len(branches) - sent; dead > 0 {
-		jm.markBranchesDead(j, dead)
+	if len(dead) > 0 {
+		jm.markBranchesDead(j, len(dead))
 	}
 	return j.result, nil
 }
@@ -356,8 +368,12 @@ func (jm *JobManager) poolShortfall(live int) error {
 	return fmt.Errorf("%w: need %d distinct relays, pool has %d live", ErrPoolTooSmall, jm.sampleSize(), live)
 }
 
-// settle delivers res on a job already removed from the maps
+// settle delivers res on a job already removed from the maps; the observer
+// hears about the settle before the caller can see the result
 func (jm *JobManager) settle(j *discoveryJob, res JobResult) {
+	if jm.obs != nil {
+		jm.obs.OnSettled(j.id, j.cid, settleKindOf(res), time.Now())
+	}
 	jm.scrub(j)
 	j.result <- res
 	close(j.result)
@@ -774,14 +790,19 @@ func (jm *JobManager) consumeInvalid(id SURBID) {
 	j := jm.jobs[jobID]
 	delete(jm.bySURB, id)
 	bi := j.branchOf[id]
+	attempt := j.attempt
 	j.invalidOf[bi]++
+	exhausted := j.invalidOf[bi] == jm.m
 	var outcome quorumOutcome
 	var res JobResult
-	if j.invalidOf[bi] == jm.m {
+	if exhausted {
 		j.exhaustedBranches++
 		outcome, res = jm.quorumLocked(j)
 	}
 	jm.mu.Unlock()
+	if exhausted {
+		jm.observeBranch(jobID, attempt, bi, BranchExhausted)
+	}
 	jm.surbs.Delete(id)
 	jm.metrics.RepliesInvalid.Add(1)
 	switch outcome {
@@ -810,6 +831,7 @@ func (jm *JobManager) answerBranch(id SURBID, kind answerKind, providers []peer.
 	}
 	j := jm.jobs[jobID]
 	bi := j.branchOf[id]
+	attempt := j.attempt
 	stale := make([]SURBID, 0, jm.m)
 	for _, sid := range j.surbIDs {
 		if j.branchOf[sid] == bi {
@@ -826,6 +848,13 @@ func (jm *JobManager) answerBranch(id SURBID, kind answerKind, providers []peer.
 	}
 	outcome, res := jm.quorumLocked(j)
 	jm.mu.Unlock()
+
+	switch kind {
+	case answerOK:
+		jm.observeBranch(jobID, attempt, bi, BranchOK)
+	case answerFailed:
+		jm.observeBranch(jobID, attempt, bi, BranchFailed)
+	}
 
 	// idempotent against a concurrent settle's scrub
 	for _, sid := range stale {
@@ -912,6 +941,28 @@ func resultOf(j *discoveryJob) JobResult {
 	return JobResult{Err: ErrSendFailed}
 }
 
+// settleKindOf labels a job result for the observer; the errors.Is chain
+// also catches the wrapped retransmit shortfall
+func settleKindOf(res JobResult) SettleKind {
+	switch {
+	case res.Err == nil:
+		return SettleSuccess
+	case errors.Is(res.Err, ErrJobTimeout):
+		return SettleTimeout
+	case errors.Is(res.Err, ErrDiscoveryFailed):
+		return SettleFailed
+	case errors.Is(res.Err, ErrInvalidReplies):
+		return SettleInvalidReplies
+	case errors.Is(res.Err, ErrSendFailed):
+		return SettleSendFailed
+	case errors.Is(res.Err, ErrPoolTooSmall):
+		return SettlePoolShortfall
+	case errors.Is(res.Err, ErrManagerClosed):
+		return SettleClosed
+	}
+	return SettleOther
+}
+
 // settleQuorum settles a job already removed from the maps and books the
 // outcome
 func (jm *JobManager) settleQuorum(j *discoveryJob, res JobResult) {
@@ -994,20 +1045,28 @@ func (jm *JobManager) retransmit(j *discoveryJob) {
 	}
 	jm.registerAttemptLocked(j, draw, branches)
 	jm.mu.Unlock()
+
+	jm.observeAttempt(j.id, j.cid, 2, draw)
 	jm.metrics.Retransmits.Add(1)
 
 	// the StartJob ctx bounded only the first attempt; even if every send
 	// fails, the final timer settles the job
 	sent := 0
-	for _, b := range branches {
+	var dead []int
+	for bi, b := range branches {
 		sctx, cancel := context.WithTimeout(context.Background(), relayTimeout)
 		if jm.sendBranch(sctx, b) {
 			sent++
+		} else {
+			dead = append(dead, bi)
 		}
 		cancel()
 	}
-	if dead := len(branches) - sent; dead > 0 {
-		jm.markBranchesDead(j, dead)
+	for _, bi := range dead {
+		jm.observeBranch(j.id, 2, bi, BranchDeadSend)
+	}
+	if len(dead) > 0 {
+		jm.markBranchesDead(j, len(dead))
 	}
 }
 
@@ -1028,4 +1087,38 @@ func (jm *JobManager) scrub(j *discoveryJob) {
 	for _, sid := range j.surbIDs {
 		jm.surbs.Delete(sid)
 	}
+}
+
+// attemptPaths reads the final slot assignment out of a full attempt draw;
+// call it only after buildBranches, whose edge bias permutes the draw
+func (jm *JobManager) attemptPaths(draw []KeyInfo) []BranchPath {
+	g := jm.branchGroupSize()
+	paths := make([]BranchPath, jm.k)
+	for bi := range paths {
+		group := draw[bi*g : (bi+1)*g]
+		fwd := make([]peer.ID, NrHops)
+		for i, ki := range group[:NrHops] {
+			fwd[i] = ki.PeerID
+		}
+		rets := make([][]peer.ID, jm.m)
+		for i := range jm.m {
+			rets[i] = []peer.ID{group[NrHops+2*i].PeerID, group[NrHops+2*i+1].PeerID}
+		}
+		paths[bi] = BranchPath{Forward: fwd, Returns: rets}
+	}
+	return paths
+}
+
+func (jm *JobManager) observeAttempt(jobID uint64, c cid.Cid, attempt int, draw []KeyInfo) {
+	if jm.obs == nil {
+		return
+	}
+	jm.obs.OnAttempt(jobID, c, attempt, jm.attemptPaths(draw))
+}
+
+func (jm *JobManager) observeBranch(jobID uint64, attempt, branch int, o BranchOutcome) {
+	if jm.obs == nil {
+		return
+	}
+	jm.obs.OnBranchOutcome(jobID, attempt, branch, o, time.Now())
 }
