@@ -312,18 +312,22 @@ func New(parent context.Context, network bsnet.BitSwapNetwork, providerFinder ro
 		provSearchDelay time.Duration,
 		rebroadcastDelay time.Duration,
 		self peer.ID,
+		opts bssm.SessionOpts,
 	) bssm.Session {
 		// careful when bs.pqm is nil. Since we are type-casting it
 		// into routing.ContentDiscovery when passing it, it will become
 		// not nil. Related:
 		// https://groups.google.com/g/golang-nuts/c/wnH302gBa4I?pli=1
 		var sessionProvFinder routing.ContentDiscovery
-		if bs.pqm != nil {
+		switch {
+		case opts.ProviderFinder != nil:
+			sessionProvFinder = opts.ProviderFinder
+		case bs.pqm != nil:
 			sessionProvFinder = bs.pqm
-		} else if providerFinder != nil {
+		case providerFinder != nil:
 			sessionProvFinder = providerFinder
 		}
-		return bssession.New(sessctx, sessmgr, id, spm, sessionProvFinder, sim, pm, bpm, notif, provSearchDelay, rebroadcastDelay, self, bs.havesReceivedGauge)
+		return bssession.New(sessctx, sessmgr, id, spm, sessionProvFinder, sim, pm, bpm, notif, provSearchDelay, rebroadcastDelay, self, bs.havesReceivedGauge, opts.NoBroadcast)
 	}
 	sessionPeerManagerFactory := func(id uint64) bssession.SessionPeerManager {
 		return bsspm.New(id, network)
@@ -728,4 +732,39 @@ func (bs *Client) NewSession(ctx context.Context) exchange.Fetcher {
 	defer span.End()
 
 	return bs.sm.NewSession(ctx, bs.provSearchDelay, bs.rebroadcastDelay)
+}
+
+// SessionOption configures a session created with NewSessionWithOptions.
+type SessionOption func(*sessionConfig)
+
+type sessionConfig struct {
+	providerFinder routing.ContentDiscovery
+	noBroadcast    bool
+}
+
+// WithAnonymousDiscovery routes the session's provider lookups through
+// finder and suppresses the session's want-have broadcasts to connected
+// peers, so interest in a CID never leaves the node in plaintext. The
+// finder must not be nil; typically it wraps an anonymizing lookup in a
+// ProviderQueryManager.
+func WithAnonymousDiscovery(finder routing.ContentDiscovery) SessionOption {
+	return func(cfg *sessionConfig) {
+		cfg.providerFinder = finder
+		cfg.noBroadcast = true
+	}
+}
+
+// NewSessionWithOptions is NewSession with per-session overrides applied.
+func (bs *Client) NewSessionWithOptions(ctx context.Context, options ...SessionOption) exchange.Fetcher {
+	ctx, span := internal.StartSpan(ctx, "NewSessionWithOptions")
+	defer span.End()
+
+	var cfg sessionConfig
+	for _, o := range options {
+		o(&cfg)
+	}
+	return bs.sm.NewSessionWithOpts(ctx, bs.provSearchDelay, bs.rebroadcastDelay, bssm.SessionOpts{
+		ProviderFinder: cfg.providerFinder,
+		NoBroadcast:    cfg.noBroadcast,
+	})
 }

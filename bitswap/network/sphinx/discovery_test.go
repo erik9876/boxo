@@ -53,6 +53,25 @@ func (jm *JobManager) pendingJobRelays(t *testing.T) map[peer.ID]struct{} {
 	return nil
 }
 
+// pendingJobProxies snapshots the branch proxies drawn so far for the
+// single pending job; test hook
+func (jm *JobManager) pendingJobProxies(t *testing.T) map[peer.ID]struct{} {
+	t.Helper()
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+	if len(jm.jobs) != 1 {
+		t.Fatalf("want exactly 1 pending job, have %d", len(jm.jobs))
+	}
+	for _, j := range jm.jobs {
+		out := make(map[peer.ID]struct{}, len(j.proxies))
+		for pid := range j.proxies {
+			out[pid] = struct{}{}
+		}
+		return out
+	}
+	return nil
+}
+
 // fillPool puts n freshly generated relay records into pool
 func fillPool(t *testing.T, pool *KeyStore, n int) {
 	t.Helper()
@@ -411,7 +430,10 @@ func TestDisableRetransmitSingleAttempt(t *testing.T) {
 	}
 }
 
-func TestRetransmitLateFirstAttemptReplyWins(t *testing.T) {
+// the attempt timer ends the first attempt for good: its SURB entries die
+// with the retry commit, a late reply through them is a duplicate, and
+// only the retry's branches can still settle the job
+func TestRetryIgnoresLateFirstAttemptReply(t *testing.T) {
 	sender := &fakeSender{}
 	k, m := 2, 2
 	need := jobSampleSize(k, m)
@@ -433,34 +455,148 @@ func TestRetransmitLateFirstAttemptReplyWins(t *testing.T) {
 	if met.Retransmits != 1 || met.RetransmitsFailed != 0 {
 		t.Fatalf("retransmit counters = %d / %d failed, want 1 / 0", met.Retransmits, met.RetransmitsFailed)
 	}
-	if surbs.Len() != 2*k*m {
-		t.Errorf("surb store holds %d entries after the retransmit, want 2·k·m = %d", surbs.Len(), 2*k*m)
+	if surbs.Len() != k*m {
+		t.Errorf("surb store holds %d entries after the retransmit, want only the retry's k·m = %d", surbs.Len(), k*m)
+	}
+	if _, surbIDs := jm.pendingCounts(); surbIDs != k*m {
+		t.Errorf("job maps %d surb ids after the retransmit, want %d", surbIDs, k*m)
 	}
 
-	// A late reply through a FIRST-attempt SURB still wins: those entries
-	// stay registered until the job ends
+	// A late reply through a FIRST-attempt SURB finds no keys: for the
+	// initiator it is the same event as a lost one
 	want := testProviders(t, 3)
 	payload, err := EncodeReply(ReplyStatusOK, want)
 	if err != nil {
 		t.Fatalf("EncodeReply: %v", err)
 	}
 	jm.HandleSURBReply(ids1[0], payload)
-	got, ok := <-res
-	if !ok || got.Err != nil {
-		t.Fatalf("job settled with ok=%v err=%v, want success from the late reply", ok, got.Err)
+	select {
+	case got := <-res:
+		t.Fatalf("a late first-attempt reply settled the job: %+v", got)
+	default:
 	}
-	assertProvidersEqual(t, got.Providers, want)
+	if met := jm.Metrics(); met.RepliesDuplicate != 1 || met.RepliesCollected != 0 {
+		t.Errorf("counters = %d duplicate / %d collected, want 1 / 0", met.RepliesDuplicate, met.RepliesCollected)
+	}
 
-	// Exactly one retry: no third wave after another timeout period
-	time.Sleep(300 * time.Millisecond)
-	if sent := len(sender.snapshot()); sent != 2*k {
-		t.Errorf("job sent %d packets, want exactly 2·k = %d (one retransmit)", sent, 2*k)
+	// the retry's own branches settle the job
+	for _, id := range jm.pendingSURBIDs() {
+		jm.HandleSURBReply(id, payload)
+	}
+	select {
+	case got, ok := <-res:
+		if !ok || got.Err != nil {
+			t.Fatalf("job settled with ok=%v err=%v, want success from the retry", ok, got.Err)
+		}
+		assertProvidersEqual(t, got.Providers, want)
+	case <-time.After(5 * time.Second):
+		t.Fatal("retry answers never settled the job")
 	}
 	if jobs, surbIDs := jm.pendingCounts(); jobs != 0 || surbIDs != 0 {
 		t.Errorf("state after settle: %d jobs / %d surb ids", jobs, surbIDs)
 	}
 	if surbs.Len() != 0 {
-		t.Errorf("surb store holds %d entries after settle; all 2·k·m must be deleted", surbs.Len())
+		t.Errorf("surb store holds %d entries after settle", surbs.Len())
+	}
+}
+
+// the retry's quorum is its own k branches: a first-attempt branch that
+// stayed silent does not delay the retry's settle to the final timer
+func TestRetrySettlesEarlyWithoutSilentFirstAttemptBranch(t *testing.T) {
+	sender := &fakeSender{}
+	k, m := 2, 1
+	need := jobSampleSize(k, m)
+	jm, _ := newTestJobManager(t, sender, 2*need, JobConfig{Branches: k, ReturnPaths: m, Timeout: 1 * time.Second})
+
+	res, err := jm.StartJob(context.Background(), testCID(t))
+	if err != nil {
+		t.Fatalf("StartJob: %v", err)
+	}
+	ids1 := make(map[SURBID]struct{})
+	for _, id := range jm.pendingSURBIDs() {
+		ids1[id] = struct{}{}
+	}
+	// one branch reports failure, the other stays silent into the timer
+	failed, err := EncodeReply(ReplyStatusFailed, nil)
+	if err != nil {
+		t.Fatalf("EncodeReply: %v", err)
+	}
+	jm.HandleSURBReply(jm.pendingSURBIDs()[0], failed)
+
+	waitFor(t, 5*time.Second, "the retransmit wave", func() bool { return jm.Metrics().Retransmits == 1 })
+
+	// both retry branches answer; the settle must not wait for the silent
+	// first-attempt branch
+	want := testProviders(t, 2)
+	payload, err := EncodeReply(ReplyStatusOK, want)
+	if err != nil {
+		t.Fatalf("EncodeReply: %v", err)
+	}
+	for _, id := range jm.pendingSURBIDs() {
+		if _, first := ids1[id]; first {
+			continue
+		}
+		jm.HandleSURBReply(id, payload)
+	}
+	select {
+	case got, ok := <-res:
+		if !ok || got.Err != nil {
+			t.Fatalf("job settled with ok=%v err=%v, want success from the retry", ok, got.Err)
+		}
+		assertProvidersEqual(t, got.Providers, want)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("retry quorum did not settle early; the silent first-attempt branch still blocks it")
+	}
+}
+
+// The demotion covers the proxies of the whole job: one drawn for the
+// first attempt still sorts last when the retry's proxy names it
+func TestRetransmitDemotesFirstAttemptProxy(t *testing.T) {
+	sender := &fakeSender{}
+	k, m := 1, 1
+	need := jobSampleSize(k, m)
+	jm, _ := newTestJobManager(t, sender, 2*need, JobConfig{Branches: k, ReturnPaths: m, Timeout: 200 * time.Millisecond})
+
+	res, err := jm.StartJob(context.Background(), testCID(t))
+	if err != nil {
+		t.Fatalf("StartJob: %v", err)
+	}
+	// snapshot before the retransmit adds its own proxy to the set
+	first := jm.pendingJobProxies(t)
+	if len(first) != k {
+		t.Fatalf("first attempt drew %d proxies, want %d", len(first), k)
+	}
+	var proxy1 peer.ID
+	for pid := range first {
+		proxy1 = pid
+	}
+	ids1 := map[SURBID]struct{}{}
+	for _, id := range jm.pendingSURBIDs() {
+		ids1[id] = struct{}{}
+	}
+
+	waitFor(t, 5*time.Second, "the retransmit wave", func() bool { return jm.Metrics().Retransmits == 1 })
+
+	// the retry's proxy answers and names the first attempt's proxy
+	_, plain := newIdentity(t)
+	payload, err := EncodeReply(ReplyStatusOK, []peer.AddrInfo{{ID: proxy1}, {ID: plain}})
+	if err != nil {
+		t.Fatalf("EncodeReply: %v", err)
+	}
+	var id2 SURBID
+	for _, id := range jm.pendingSURBIDs() {
+		if _, first := ids1[id]; !first {
+			id2 = id
+		}
+	}
+	jm.HandleSURBReply(id2, payload)
+
+	got, ok := <-res
+	if !ok || got.Err != nil {
+		t.Fatalf("job settled with ok=%v err=%v, want success from the retry reply", ok, got.Err)
+	}
+	if len(got.Providers) != 2 || got.Providers[0].ID != plain || got.Providers[1].ID != proxy1 {
+		t.Fatalf("providers %v, want %s ahead of the first attempt's proxy %s", got.Providers, plain, proxy1)
 	}
 }
 
@@ -517,7 +653,10 @@ func TestRetransmitExclusionFallsBack(t *testing.T) {
 	}
 }
 
-func TestRetransmitPoolTooSmallDegrades(t *testing.T) {
+// a retransmit that cannot draw settles the job at once: the first
+// attempt's SURBs died with the retry commit, so there is nothing left a
+// final timer could wait for
+func TestRetransmitPoolTooSmallSettlesShortfall(t *testing.T) {
 	sender := &fakeSender{}
 	k, m := 1, ReturnPathsPerJob
 	jm, surbs := newTestJobManager(t, sender, jobSampleSize(k, m), JobConfig{Branches: k, Timeout: 150 * time.Millisecond})
@@ -526,43 +665,42 @@ func TestRetransmitPoolTooSmallDegrades(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartJob: %v", err)
 	}
-	// Kill the pool before the retransmit draws: the retransmit must
-	// degrade, not fail the job: the first attempt's SURBs stay live
-	// until the final timer
+	// Kill the pool before the retransmit draws
 	expirePool(jm.pool)
 
-	waitFor(t, 5*time.Second, "the degraded retransmit", func() bool { return jm.Metrics().RetransmitsFailed == 1 })
-	if surbs.Len() != k*m {
-		t.Errorf("surb store holds %d entries after the degrade, want the first attempt's %d", surbs.Len(), k*m)
-	}
+	waitFor(t, 5*time.Second, "the failed retransmit", func() bool { return jm.Metrics().RetransmitsFailed == 1 })
 
 	select {
-	case got := <-res:
-		if !errors.Is(got.Err, ErrJobTimeout) {
-			t.Fatalf("degraded job settled with %v, want ErrJobTimeout", got.Err)
+	case got, ok := <-res:
+		if !ok || !errors.Is(got.Err, ErrPoolTooSmall) {
+			t.Fatalf("job settled with ok=%v err=%v, want ErrPoolTooSmall", ok, got.Err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("degraded job never timed out")
+		t.Fatal("job never settled on the shortfall")
 	}
 
 	met := jm.Metrics()
-	if met.Retransmits != 0 || met.RetransmitsFailed != 1 {
-		t.Errorf("retransmit counters = %d / %d failed, want 0 / 1", met.Retransmits, met.RetransmitsFailed)
+	if met.Retransmits != 0 || met.RetransmitsFailed != 1 || met.JobsFailed != 1 || met.JobsTimedOut != 0 {
+		t.Errorf("counters = %d retransmits / %d failed retransmits / %d failed / %d timed out, want 0 / 1 / 1 / 0",
+			met.Retransmits, met.RetransmitsFailed, met.JobsFailed, met.JobsTimedOut)
 	}
 	if sent := len(sender.snapshot()); sent != k {
 		t.Errorf("job sent %d packets, want only the first attempt's %d", sent, k)
 	}
 	if jobs, surbIDs := jm.pendingCounts(); jobs != 0 || surbIDs != 0 {
-		t.Errorf("state after final timeout: %d jobs / %d surb ids", jobs, surbIDs)
+		t.Errorf("state after settle: %d jobs / %d surb ids", jobs, surbIDs)
 	}
 	if surbs.Len() != 0 {
-		t.Errorf("surb store holds %d entries after final timeout", surbs.Len())
+		t.Errorf("surb store holds %d entries after settle", surbs.Len())
 	}
 }
 
+// with the retry disabled, a reported failure surfaces as
+// ErrDiscoveryFailed; the retrying path is covered by
+// TestAllBranchesFailedTriggersImmediateRetry
 func TestFailedReplyStatusIsReported(t *testing.T) {
 	sender := &fakeSender{}
-	jm, _ := newTestJobManager(t, sender, jobSampleSize(1, ReturnPathsPerJob), JobConfig{Branches: 1})
+	jm, _ := newTestJobManager(t, sender, jobSampleSize(1, ReturnPathsPerJob), JobConfig{Branches: 1, DisableRetransmit: true})
 
 	res, err := jm.StartJob(context.Background(), testCID(t))
 	if err != nil {
@@ -722,11 +860,13 @@ func TestFailedAnswerDoesNotBlockOtherBranch(t *testing.T) {
 	}
 }
 
-// only unanimous Failed settles the job as a discovery failure
+// with the retry disabled, unanimous Failed settles the job as a
+// discovery failure without waiting out the timer
 func TestAllBranchesFailedSettlesFailed(t *testing.T) {
 	sender := &fakeSender{}
 	k, m := 2, 1
-	jm, surbs := newTestJobManager(t, sender, jobSampleSize(k, m), JobConfig{Branches: k, ReturnPaths: m, Timeout: 10 * time.Second})
+	jm, surbs := newTestJobManager(t, sender, jobSampleSize(k, m),
+		JobConfig{Branches: k, ReturnPaths: m, Timeout: 10 * time.Second, DisableRetransmit: true})
 
 	res, err := jm.StartJob(context.Background(), testCID(t))
 	if err != nil {
@@ -752,6 +892,104 @@ func TestAllBranchesFailedSettlesFailed(t *testing.T) {
 	met := jm.Metrics()
 	if met.RepliesFailed != 2 || met.JobsFailed != 1 {
 		t.Errorf("counters = %d failed replies / %d failed jobs, want 2 / 1", met.RepliesFailed, met.JobsFailed)
+	}
+	if jobs, surbIDs := jm.pendingCounts(); jobs != 0 || surbIDs != 0 {
+		t.Errorf("state after failed settle: %d jobs / %d surb ids", jobs, surbIDs)
+	}
+	if surbs.Len() != 0 {
+		t.Errorf("surb store holds %d entries after failed settle", surbs.Len())
+	}
+}
+
+// unanimous reported failure of the first attempt is a total attempt
+// failure: the job retries at once instead of settling, since with every
+// branch accounted for there is nothing left to wait for
+func TestAllBranchesFailedTriggersImmediateRetry(t *testing.T) {
+	sender := &fakeSender{}
+	k, m := 2, 1
+	need := jobSampleSize(k, m)
+	// the long timer proves the retry is quorum-driven, not timer-driven
+	jm, _ := newTestJobManager(t, sender, 2*need, JobConfig{Branches: k, ReturnPaths: m, Timeout: 10 * time.Second})
+
+	res, err := jm.StartJob(context.Background(), testCID(t))
+	if err != nil {
+		t.Fatalf("StartJob: %v", err)
+	}
+	failed, err := EncodeReply(ReplyStatusFailed, nil)
+	if err != nil {
+		t.Fatalf("EncodeReply: %v", err)
+	}
+	for _, id := range jm.pendingSURBIDs() {
+		jm.HandleSURBReply(id, failed)
+	}
+	select {
+	case got := <-res:
+		t.Fatalf("all-failed first attempt settled the job: %+v", got)
+	default:
+	}
+	waitFor(t, 5*time.Second, "the retry wave", func() bool { return len(sender.snapshot()) == 2*k })
+
+	// the retry's branches answer; their quorum settles the job
+	want := testProviders(t, 2)
+	payload, err := EncodeReply(ReplyStatusOK, want)
+	if err != nil {
+		t.Fatalf("EncodeReply: %v", err)
+	}
+	for _, id := range jm.pendingSURBIDs() {
+		jm.HandleSURBReply(id, payload)
+	}
+	select {
+	case got, ok := <-res:
+		if !ok || got.Err != nil {
+			t.Fatalf("job settled with ok=%v err=%v, want success from the retry", ok, got.Err)
+		}
+		assertProvidersEqual(t, got.Providers, want)
+	case <-time.After(5 * time.Second):
+		t.Fatal("retry answers never settled the job")
+	}
+	met := jm.Metrics()
+	if met.Retransmits != 1 || met.RepliesFailed != 2 || met.RepliesCollected != 2 || met.JobsFailed != 0 || met.JobsSucceeded != 1 {
+		t.Errorf("counters = %d retransmits / %d failed replies / %d collected / %d failed jobs / %d succeeded, want 1 / 2 / 2 / 0 / 1",
+			met.Retransmits, met.RepliesFailed, met.RepliesCollected, met.JobsFailed, met.JobsSucceeded)
+	}
+}
+
+// the retry is the last word: a second all-failed attempt settles as a
+// reported discovery failure
+func TestRetryAllFailedAgainSettlesFailed(t *testing.T) {
+	sender := &fakeSender{}
+	k, m := 2, 1
+	need := jobSampleSize(k, m)
+	jm, surbs := newTestJobManager(t, sender, 2*need, JobConfig{Branches: k, ReturnPaths: m, Timeout: 10 * time.Second})
+
+	res, err := jm.StartJob(context.Background(), testCID(t))
+	if err != nil {
+		t.Fatalf("StartJob: %v", err)
+	}
+	failed, err := EncodeReply(ReplyStatusFailed, nil)
+	if err != nil {
+		t.Fatalf("EncodeReply: %v", err)
+	}
+	for _, id := range jm.pendingSURBIDs() {
+		jm.HandleSURBReply(id, failed)
+	}
+	waitFor(t, 5*time.Second, "the retry wave", func() bool { return len(sender.snapshot()) == 2*k })
+	for _, id := range jm.pendingSURBIDs() {
+		jm.HandleSURBReply(id, failed)
+	}
+
+	select {
+	case got, ok := <-res:
+		if !ok || !errors.Is(got.Err, ErrDiscoveryFailed) {
+			t.Fatalf("job settled with ok=%v err=%v, want ErrDiscoveryFailed", ok, got.Err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("all-failed retry never settled the job")
+	}
+	met := jm.Metrics()
+	if met.Retransmits != 1 || met.RepliesFailed != 4 || met.JobsFailed != 1 {
+		t.Errorf("counters = %d retransmits / %d failed replies / %d failed jobs, want 1 / 4 / 1",
+			met.Retransmits, met.RepliesFailed, met.JobsFailed)
 	}
 	if jobs, surbIDs := jm.pendingCounts(); jobs != 0 || surbIDs != 0 {
 		t.Errorf("state after failed settle: %d jobs / %d surb ids", jobs, surbIDs)
@@ -827,7 +1065,7 @@ func TestMergeAnswers(t *testing.T) {
 		// pidA twice in one list must count as one confirmation
 		{{ID: pidA, Addrs: []ma.Multiaddr{addr1}}, {ID: pidA, Addrs: []ma.Multiaddr{addr1, addr2}}, {ID: pidB}},
 		{{ID: pidC}, {ID: pidB}},
-	})
+	}, nil)
 	if len(got) != 3 {
 		t.Fatalf("merged %d providers, want 3: %v", len(got), got)
 	}
@@ -839,15 +1077,44 @@ func TestMergeAnswers(t *testing.T) {
 	}
 
 	single := []peer.AddrInfo{{ID: pidA}}
-	if got := mergeAnswers([][]peer.AddrInfo{single}); len(got) != 1 || got[0].ID != pidA {
+	if got := mergeAnswers([][]peer.AddrInfo{single}, nil); len(got) != 1 || got[0].ID != pidA {
 		t.Fatalf("single-list merge changed the list: %v", got)
 	}
 }
 
-func TestUndecodableReplyDiscardsOnlyThatBranch(t *testing.T) {
+// The job's proxies sort to the end of the merged list, behind entries a
+// single branch named, and stay in it
+func TestMergeAnswersDemotesProxies(t *testing.T) {
+	_, pidA := newIdentity(t)
+	_, pidB := newIdentity(t)
+	_, proxy := newIdentity(t)
+	drawn := map[peer.ID]struct{}{proxy: {}}
+
+	// the proxy is the only entry both branches confirm and still ends last
+	got := mergeAnswers([][]peer.AddrInfo{
+		{{ID: proxy}, {ID: pidA}},
+		{{ID: proxy}, {ID: pidB}},
+	}, drawn)
+	if len(got) != 3 {
+		t.Fatalf("merged %d providers, want 3: %v", len(got), got)
+	}
+	if got[0].ID != pidA || got[1].ID != pidB || got[2].ID != proxy {
+		t.Fatalf("merged order %v, want [%s %s %s]", got, pidA, pidB, proxy)
+	}
+
+	got = mergeAnswers([][]peer.AddrInfo{{{ID: proxy}, {ID: pidA}}}, drawn)
+	if len(got) != 2 || got[0].ID != pidA || got[1].ID != proxy {
+		t.Fatalf("single-list merge %v, want the proxy demoted behind %s", got, pidA)
+	}
+}
+
+// at m = 1 a single garbled copy already exhausts its branch, so the
+// healthy branch's answer completes the quorum and settles at once
+func TestUndecodableReplyDoesNotBlockOtherBranch(t *testing.T) {
 	sender := &fakeSender{}
 	k, m := 2, 1 // one SURB per branch: the garbage reply names one branch
-	jm, surbs := newTestJobManager(t, sender, jobSampleSize(k, m), JobConfig{Branches: k, ReturnPaths: m})
+	// the long timer proves the settle is quorum-driven, not timer-driven
+	jm, surbs := newTestJobManager(t, sender, jobSampleSize(k, m), JobConfig{Branches: k, ReturnPaths: m, Timeout: 10 * time.Second})
 
 	res, err := jm.StartJob(context.Background(), testCID(t))
 	if err != nil {
@@ -858,14 +1125,9 @@ func TestUndecodableReplyDiscardsOnlyThatBranch(t *testing.T) {
 		t.Fatalf("job registered %d surb ids, want %d", len(ids), k*m)
 	}
 
-	// One branch's proxy answers garbage: that contribution is discarded,
-	// the job stays pending on the other branch
+	// One branch's proxy answers garbage: no answer, but its only envelope
+	// is spent, so the branch is exhausted
 	jm.HandleSURBReply(ids[0], []byte("garbage"))
-	select {
-	case got := <-res:
-		t.Fatalf("undecodable reply settled the job: %+v", got)
-	default:
-	}
 	if jobs, surbIDs := jm.pendingCounts(); jobs != 1 || surbIDs != k*m-1 {
 		t.Errorf("state after discard: %d jobs / %d surb ids, want 1 / %d", jobs, surbIDs, k*m-1)
 	}
@@ -873,7 +1135,62 @@ func TestUndecodableReplyDiscardsOnlyThatBranch(t *testing.T) {
 		t.Errorf("RepliesInvalid = %d, want 1", met.RepliesInvalid)
 	}
 
-	// The other branch settles the job normally
+	// The healthy branch answers and completes the quorum on its own
+	want := testProviders(t, 2)
+	payload, err := EncodeReply(ReplyStatusOK, want)
+	if err != nil {
+		t.Fatalf("EncodeReply: %v", err)
+	}
+	jm.HandleSURBReply(ids[1], payload)
+	select {
+	case got, ok := <-res:
+		if !ok || got.Err != nil {
+			t.Fatalf("job settled with ok=%v err=%v, want success via the healthy branch", ok, got.Err)
+		}
+		assertProvidersEqual(t, got.Providers, want)
+	case <-time.After(5 * time.Second):
+		t.Fatal("job never settled")
+	}
+	if met := jm.Metrics(); met.Retransmits != 0 || met.JobsSucceeded != 1 {
+		t.Errorf("counters = %d retransmits / %d succeeded, want 0 / 1", met.Retransmits, met.JobsSucceeded)
+	}
+	if surbs.Len() != 0 {
+		t.Errorf("surb store holds %d entries after settle", surbs.Len())
+	}
+}
+
+// an undecodable copy consumes only its own envelope: the branch stays
+// open and a later valid copy still settles it
+func TestInvalidCopyLeavesBranchOpenForSibling(t *testing.T) {
+	sender := &fakeSender{}
+	k, m := 1, 2 // two copies of the same branch can answer
+	jm, surbs := newTestJobManager(t, sender, jobSampleSize(k, m), JobConfig{Branches: k, ReturnPaths: m, Timeout: 10 * time.Second})
+
+	res, err := jm.StartJob(context.Background(), testCID(t))
+	if err != nil {
+		t.Fatalf("StartJob: %v", err)
+	}
+	ids := jm.pendingSURBIDs()
+	if len(ids) != k*m {
+		t.Fatalf("job registered %d surb ids, want %d", len(ids), k*m)
+	}
+
+	jm.HandleSURBReply(ids[0], []byte("garbage"))
+	select {
+	case got := <-res:
+		t.Fatalf("undecodable copy settled the job: %+v", got)
+	default:
+	}
+	// only the garbage copy's envelope is gone; the sibling stays mapped
+	if jobs, surbIDs := jm.pendingCounts(); jobs != 1 || surbIDs != k*m-1 {
+		t.Errorf("state after discard: %d jobs / %d surb ids, want 1 / %d", jobs, surbIDs, k*m-1)
+	}
+	// a second delivery through the consumed envelope is a duplicate
+	jm.HandleSURBReply(ids[0], []byte("garbage"))
+	if met := jm.Metrics(); met.RepliesInvalid != 1 || met.RepliesDuplicate != 1 {
+		t.Errorf("counters = %d invalid / %d duplicate, want 1 / 1", met.RepliesInvalid, met.RepliesDuplicate)
+	}
+
 	want := testProviders(t, 2)
 	payload, err := EncodeReply(ReplyStatusOK, want)
 	if err != nil {
@@ -882,9 +1199,147 @@ func TestUndecodableReplyDiscardsOnlyThatBranch(t *testing.T) {
 	jm.HandleSURBReply(ids[1], payload)
 	got, ok := <-res
 	if !ok || got.Err != nil {
-		t.Fatalf("job settled with ok=%v err=%v, want success via the healthy branch", ok, got.Err)
+		t.Fatalf("job settled with ok=%v err=%v, want success via the sibling copy", ok, got.Err)
 	}
 	assertProvidersEqual(t, got.Providers, want)
+	if surbs.Len() != 0 {
+		t.Errorf("surb store holds %d entries after settle", surbs.Len())
+	}
+}
+
+// a branch whose every envelope came back undecodable is exhausted: no
+// copy can arrive anymore, so the first attempt retries at once instead
+// of waiting out its timer
+func TestAllInvalidExhaustsBranchAndRetriesImmediately(t *testing.T) {
+	sender := &fakeSender{}
+	k, m := 1, 3
+	need := jobSampleSize(k, m)
+	// the long timer proves the retry is exhaustion-driven, not timer-driven
+	jm, _ := newTestJobManager(t, sender, 2*need, JobConfig{Branches: k, ReturnPaths: m, Timeout: 10 * time.Second})
+
+	res, err := jm.StartJob(context.Background(), testCID(t))
+	if err != nil {
+		t.Fatalf("StartJob: %v", err)
+	}
+	for _, id := range jm.pendingSURBIDs() {
+		jm.HandleSURBReply(id, []byte("garbage"))
+	}
+	select {
+	case got := <-res:
+		t.Fatalf("all-invalid branch settled the job: %+v", got)
+	default:
+	}
+
+	waitFor(t, 5*time.Second, "the retry wave", func() bool { return jm.Metrics().Retransmits == 1 })
+
+	payload, err := EncodeReply(ReplyStatusOK, testProviders(t, 2))
+	if err != nil {
+		t.Fatalf("EncodeReply: %v", err)
+	}
+	jm.HandleSURBReply(jm.pendingSURBIDs()[0], payload)
+	select {
+	case got, ok := <-res:
+		if !ok || got.Err != nil {
+			t.Fatalf("job settled with ok=%v err=%v, want success from the retry", ok, got.Err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("retry answer never settled the job")
+	}
+	met := jm.Metrics()
+	if met.RepliesInvalid != uint64(k*m) || met.JobsFailed != 0 || met.JobsSucceeded != 1 {
+		t.Errorf("counters = %d invalid / %d failed jobs / %d succeeded, want %d / 0 / 1",
+			met.RepliesInvalid, met.JobsFailed, met.JobsSucceeded, k*m)
+	}
+}
+
+// a Failed reply settles its branch at once; the other branch exhausts
+// through its garbled copies, and together they retry immediately
+func TestFailedAndExhaustedBranchesRetryImmediately(t *testing.T) {
+	sender := &fakeSender{}
+	k, m := 2, 2
+	need := jobSampleSize(k, m)
+	jm, _ := newTestJobManager(t, sender, 2*need, JobConfig{Branches: k, ReturnPaths: m, Timeout: 10 * time.Second})
+
+	res, err := jm.StartJob(context.Background(), testCID(t))
+	if err != nil {
+		t.Fatalf("StartJob: %v", err)
+	}
+	failed, err := EncodeReply(ReplyStatusFailed, nil)
+	if err != nil {
+		t.Fatalf("EncodeReply: %v", err)
+	}
+	jm.HandleSURBReply(jm.pendingSURBIDs()[0], failed)
+	// the Failed answer retired its whole branch, sibling envelope included
+	rest := jm.pendingSURBIDs()
+	if len(rest) != m {
+		t.Fatalf("%d envelopes left after the Failed branch retired, want the other branch's %d", len(rest), m)
+	}
+	for _, id := range rest {
+		jm.HandleSURBReply(id, []byte("garbage"))
+	}
+
+	waitFor(t, 5*time.Second, "the retry wave", func() bool { return len(sender.snapshot()) == 2*k })
+
+	want := testProviders(t, 2)
+	payload, err := EncodeReply(ReplyStatusOK, want)
+	if err != nil {
+		t.Fatalf("EncodeReply: %v", err)
+	}
+	for _, id := range jm.pendingSURBIDs() {
+		jm.HandleSURBReply(id, payload)
+	}
+	select {
+	case got, ok := <-res:
+		if !ok || got.Err != nil {
+			t.Fatalf("job settled with ok=%v err=%v, want success from the retry", ok, got.Err)
+		}
+		assertProvidersEqual(t, got.Providers, want)
+	case <-time.After(5 * time.Second):
+		t.Fatal("retry answers never settled the job")
+	}
+	met := jm.Metrics()
+	if met.Retransmits != 1 || met.RepliesFailed != 1 || met.RepliesInvalid != uint64(m) {
+		t.Errorf("counters = %d retransmits / %d failed replies / %d invalid, want 1 / 1 / %d",
+			met.Retransmits, met.RepliesFailed, met.RepliesInvalid, m)
+	}
+}
+
+// a retry that exhausts again settles as ErrInvalidReplies: every reply
+// of the job arrived, none was readable
+func TestRetryExhaustedAgainSettlesInvalidReplies(t *testing.T) {
+	sender := &fakeSender{}
+	k, m := 1, 2
+	need := jobSampleSize(k, m)
+	jm, surbs := newTestJobManager(t, sender, 2*need, JobConfig{Branches: k, ReturnPaths: m, Timeout: 300 * time.Millisecond})
+
+	res, err := jm.StartJob(context.Background(), testCID(t))
+	if err != nil {
+		t.Fatalf("StartJob: %v", err)
+	}
+	for _, id := range jm.pendingSURBIDs() {
+		jm.HandleSURBReply(id, []byte("garbage"))
+	}
+	waitFor(t, 5*time.Second, "the retry wave", func() bool { return jm.Metrics().Retransmits == 1 })
+	for _, id := range jm.pendingSURBIDs() {
+		jm.HandleSURBReply(id, []byte("garbage"))
+	}
+
+	select {
+	case got, ok := <-res:
+		if !ok || !errors.Is(got.Err, ErrInvalidReplies) {
+			t.Fatalf("job settled with ok=%v err=%v, want ErrInvalidReplies", ok, got.Err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("exhausted retry never settled the job")
+	}
+	met := jm.Metrics()
+	if met.RepliesInvalid != uint64(2*k*m) || met.JobsFailed != 1 || met.JobsTimedOut != 0 {
+		t.Errorf("counters = %d invalid / %d failed / %d timed out, want %d / 1 / 0",
+			met.RepliesInvalid, met.JobsFailed, met.JobsTimedOut, 2*k*m)
+	}
+	if jobs, surbIDs := jm.pendingCounts(); jobs != 0 || surbIDs != 0 {
+		t.Errorf("state after settle: %d jobs / %d surb ids", jobs, surbIDs)
+	}
 	if surbs.Len() != 0 {
 		t.Errorf("surb store holds %d entries after settle", surbs.Len())
 	}
@@ -942,23 +1397,113 @@ func TestStartJobAllowedWhenServing(t *testing.T) {
 	}
 }
 
-func TestStartJobAllBranchSendsFailCleansUp(t *testing.T) {
+// a first attempt whose sends all fail is a total attempt failure like
+// all-Failed: StartJob hands out the result channel and the job retries
+func TestAllBranchSendsFailedTriggersRetry(t *testing.T) {
+	sender := &flakySender{failFirst: 2}
+	k, m := 2, 1
+	need := jobSampleSize(k, m)
+	jm, _ := newTestJobManager(t, sender, 2*need, JobConfig{Branches: k, ReturnPaths: m, Timeout: 10 * time.Second})
+
+	res, err := jm.StartJob(context.Background(), testCID(t))
+	if err != nil {
+		t.Fatalf("StartJob with every first-attempt send failing: %v", err)
+	}
+	// the captured sends are the retry's: the first attempt never left
+	waitFor(t, 5*time.Second, "the retry wave", func() bool { return len(sender.snapshot()) == k })
+	met := jm.Metrics()
+	if met.SendFailures != uint64(k) || met.Retransmits != 1 || met.JobsStarted != 1 {
+		t.Errorf("counters = %d send failures / %d retransmits / %d started, want %d / 1 / 1",
+			met.SendFailures, met.Retransmits, met.JobsStarted, k)
+	}
+
+	want := testProviders(t, 2)
+	payload, err := EncodeReply(ReplyStatusOK, want)
+	if err != nil {
+		t.Fatalf("EncodeReply: %v", err)
+	}
+	for _, id := range jm.pendingSURBIDs() {
+		jm.HandleSURBReply(id, payload)
+	}
+	select {
+	case got, ok := <-res:
+		if !ok || got.Err != nil {
+			t.Fatalf("job settled with ok=%v err=%v, want success from the retry", ok, got.Err)
+		}
+		assertProvidersEqual(t, got.Providers, want)
+	case <-time.After(5 * time.Second):
+		t.Fatal("retry answers never settled the job")
+	}
+}
+
+// when the retry's sends fail as well, nothing was ever in flight: the
+// job settles as ErrSendFailed, not as a reported discovery failure
+func TestAllSendsBothAttemptsFailSettlesSendFailed(t *testing.T) {
 	sender := &fakeSender{err: errors.New("dial refused")}
 	k, m := 2, ReturnPathsPerJob
-	jm, surbs := newTestJobManager(t, sender, jobSampleSize(k, m), JobConfig{Branches: k})
+	jm, surbs := newTestJobManager(t, sender, 2*jobSampleSize(k, m), JobConfig{Branches: k, Timeout: 10 * time.Second})
 
-	if _, err := jm.StartJob(context.Background(), testCID(t)); err == nil {
-		t.Fatal("StartJob succeeded although every branch send failed")
+	res, err := jm.StartJob(context.Background(), testCID(t))
+	if err != nil {
+		t.Fatalf("StartJob with failing sends: %v", err)
+	}
+	select {
+	case got, ok := <-res:
+		if !ok || !errors.Is(got.Err, ErrSendFailed) {
+			t.Fatalf("job settled with ok=%v err=%v, want ErrSendFailed", ok, got.Err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("sendless job never settled")
 	}
 	met := jm.Metrics()
-	if met.SendFailures != uint64(k) || met.JobsStarted != 0 {
-		t.Errorf("counters = %d send failures / %d started, want %d / 0", met.SendFailures, met.JobsStarted, k)
+	if met.SendFailures != uint64(2*k) || met.Retransmits != 1 || met.JobsStarted != 1 || met.JobsFailed != 1 {
+		t.Errorf("counters = %d send failures / %d retransmits / %d started / %d failed, want %d / 1 / 1 / 1",
+			met.SendFailures, met.Retransmits, met.JobsStarted, met.JobsFailed, 2*k)
 	}
 	if jobs, surbIDs := jm.pendingCounts(); jobs != 0 || surbIDs != 0 {
 		t.Errorf("send failure left state: %d jobs / %d surb ids", jobs, surbIDs)
 	}
 	if surbs.Len() != 0 {
 		t.Errorf("send failure left %d surb entries", surbs.Len())
+	}
+}
+
+// a dead branch and a Failed answer together exhaust the first attempt,
+// which retries: send failures count toward the same one retry
+func TestDeadBranchPlusFailedReplyTriggersRetry(t *testing.T) {
+	sender := &flakySender{failFirst: 1}
+	k, m := 2, 1
+	need := jobSampleSize(k, m)
+	jm, _ := newTestJobManager(t, sender, 2*need, JobConfig{Branches: k, ReturnPaths: m, Timeout: 10 * time.Second})
+
+	res, err := jm.StartJob(context.Background(), testCID(t))
+	if err != nil {
+		t.Fatalf("StartJob with one dead branch: %v", err)
+	}
+	failed, err := EncodeReply(ReplyStatusFailed, nil)
+	if err != nil {
+		t.Fatalf("EncodeReply: %v", err)
+	}
+	jm.HandleSURBReply(jm.pendingSURBIDs()[0], failed)
+
+	waitFor(t, 5*time.Second, "the retry wave", func() bool { return jm.Metrics().Retransmits == 1 })
+
+	want := testProviders(t, 2)
+	payload, err := EncodeReply(ReplyStatusOK, want)
+	if err != nil {
+		t.Fatalf("EncodeReply: %v", err)
+	}
+	for _, id := range jm.pendingSURBIDs() {
+		jm.HandleSURBReply(id, payload)
+	}
+	select {
+	case got, ok := <-res:
+		if !ok || got.Err != nil {
+			t.Fatalf("job settled with ok=%v err=%v, want success from the retry", ok, got.Err)
+		}
+		assertProvidersEqual(t, got.Providers, want)
+	case <-time.After(5 * time.Second):
+		t.Fatal("retry answers never settled the job")
 	}
 }
 
@@ -1600,6 +2145,34 @@ func TestBiasEdgePreservesDisjointness(t *testing.T) {
 	}
 	if relays := jm.pendingJobRelays(t); len(relays) != need {
 		t.Errorf("job drew %d distinct relays under bias, want %d (fully disjoint)", len(relays), need)
+	}
+}
+
+// The permutation leaves every proxy on its exit slot, which is what lets
+// the proxy set and the CPL metric read the draw after the bias ran
+func TestBiasEdgeKeepsProxySlots(t *testing.T) {
+	k, m := 2, ReturnPathsPerJob
+	need := jobSampleSize(k, m)
+	// half the pool connected, so the bias actively reorders
+	state := mapPeerState{conn: map[peer.ID]network.Connectedness{}}
+	jm, _ := newTestJobManager(t, &fakeSender{}, need,
+		JobConfig{Branches: k, ReturnPaths: m, InitiatorEdgeEpsilon: 0.5, PeerState: state})
+	for i, ki := range jm.pool.Sample(jm.pool.Len()) {
+		if i%2 == 0 {
+			state.conn[ki.PeerID] = network.Connected
+		}
+	}
+
+	draw := jm.drawAttempt(testCID(t), nil)
+	if len(draw) != need {
+		t.Fatalf("drew %d relays, want %d", len(draw), need)
+	}
+	before := jm.branchProxies(draw)
+	jm.biasEdgeSlots(draw)
+	for bi, after := range jm.branchProxies(draw) {
+		if before[bi].PeerID != after.PeerID {
+			t.Errorf("branch %d proxy moved from %s to %s under the edge bias", bi, before[bi].PeerID, after.PeerID)
+		}
 	}
 }
 

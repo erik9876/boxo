@@ -10,6 +10,7 @@ import (
 
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
 )
 
 // relayNode is one fully wired transport node: host, key manager, relay,
@@ -264,8 +265,9 @@ func (f *recordingFinder) lookups() []peer.ID {
 	return append([]peer.ID(nil), f.calls...)
 }
 
-func TestTransportLookupPrecedesEverySend(t *testing.T) {
-	// receiver is already connected; the lookup must run anyway
+func TestTransportLookupSkippedWhenConnected(t *testing.T) {
+	// receiver is already connected; the send rides the standing
+	// connection and no lookup runs
 	finder := &recordingFinder{}
 	sender := newRelayNodeWithFinder(t, finder)
 	receiver := newRelayNode(t)
@@ -281,13 +283,12 @@ func TestTransportLookupPrecedesEverySend(t *testing.T) {
 		t.Fatalf("SendPacket to connected peer: %v", err)
 	}
 
-	calls := finder.lookups()
-	if len(calls) != 1 || calls[0] != receiver.host.ID() {
-		t.Fatalf("finder calls = %v, want exactly one for %s", calls, receiver.host.ID())
+	if calls := finder.lookups(); len(calls) != 0 {
+		t.Fatalf("finder calls = %v, want none for a connected peer", calls)
 	}
 	m := sender.transport.Metrics()
-	if m.Lookups != 1 || m.LookupFailures != 0 {
-		t.Errorf("metrics = %+v, want 1 lookup, 0 failures", m)
+	if m.Lookups != 0 || m.LookupFailures != 0 {
+		t.Errorf("metrics = %+v, want 0 lookups, 0 failures", m)
 	}
 }
 
@@ -312,10 +313,12 @@ func TestTransportLookupSuppliesAddresses(t *testing.T) {
 }
 
 func TestTransportLookupFailureStillDials(t *testing.T) {
+	// unconnected receiver so the lookup runs; the peerstore already
+	// holds its addresses, standing in for a stale cache entry
 	finder := &recordingFinder{err: errors.New("dht unavailable")}
 	sender := newRelayNodeWithFinder(t, finder)
 	receiver := newRelayNode(t)
-	connectAll(t, sender.host, receiver.host)
+	sender.host.Peerstore().AddAddrs(receiver.host.ID(), receiver.host.Addrs(), peerstore.TempAddrTTL)
 
 	pkt, err := NewForwardPacket(newHopInfos(t, NrHops), RecipientID{}, []byte("despite failure"))
 	if err != nil {

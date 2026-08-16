@@ -14,6 +14,7 @@ import (
 	exchange "github.com/ipfs/boxo/exchange"
 	cid "github.com/ipfs/go-cid"
 	peer "github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/routing"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -38,7 +39,18 @@ type SessionFactory func(
 	notif notifications.PubSub,
 	provSearchDelay time.Duration,
 	rebroadcastDelay time.Duration,
-	self peer.ID) Session
+	self peer.ID,
+	opts SessionOpts) Session
+
+// SessionOpts are per-session overrides of the client-wide defaults.
+type SessionOpts struct {
+	// ProviderFinder, when non-nil, replaces the client-wide finder for
+	// this session's provider lookups.
+	ProviderFinder routing.ContentDiscovery
+	// NoBroadcast suppresses the session's want-have broadcasts; discovery
+	// then runs only through the provider finder.
+	NoBroadcast bool
+}
 
 // PeerManagerFactory generates a new peer manager for a session.
 type PeerManagerFactory func(id uint64) bssession.SessionPeerManager
@@ -85,13 +97,18 @@ func New(sessionFactory SessionFactory, sessionInterestManager *bssim.SessionInt
 // The returned Session must be closed via its Close() method, or by canceling
 // the context, when no longer needed.
 func (sm *SessionManager) NewSession(ctx context.Context, provSearchDelay, rebroadcastDelay time.Duration) Session {
+	return sm.NewSessionWithOpts(ctx, provSearchDelay, rebroadcastDelay, SessionOpts{})
+}
+
+// NewSessionWithOpts is NewSession with per-session overrides applied.
+func (sm *SessionManager) NewSessionWithOpts(ctx context.Context, provSearchDelay, rebroadcastDelay time.Duration, opts SessionOpts) Session {
 	id := sm.GetNextSessionID()
 
 	ctx, span := internal.StartSpan(ctx, "SessionManager.NewSession", trace.WithAttributes(attribute.String("ID", strconv.FormatUint(id, 10))))
 	defer span.End()
 
 	pm := sm.peerManagerFactory(id)
-	session := sm.sessionFactory(ctx, sm, id, pm, sm.sessionInterestManager, sm.peerManager, sm.blockPresenceManager, sm.notif, provSearchDelay, rebroadcastDelay, sm.self)
+	session := sm.sessionFactory(ctx, sm, id, pm, sm.sessionInterestManager, sm.peerManager, sm.blockPresenceManager, sm.notif, provSearchDelay, rebroadcastDelay, sm.self, opts)
 
 	sm.sessLk.Lock()
 	if sm.sessions != nil { // check if SessionManager was shutdown

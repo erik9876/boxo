@@ -31,6 +31,14 @@ var ErrJobTimeout = errors.New("discovery job timed out")
 // fallback to vanilla discovery
 var ErrDiscoveryFailed = errors.New("proxy reported discovery failure")
 
+// ErrSendFailed: every branch send of every attempt failed, so no packet
+// was ever in flight and no reply was possible
+var ErrSendFailed = errors.New("every branch send of the discovery job failed")
+
+// ErrInvalidReplies: the branches answered, but exclusively with
+// undecodable payloads; no proxy reported a result
+var ErrInvalidReplies = errors.New("every reply of the discovery job was undecodable")
+
 var ErrPoolTooSmall = errors.New("relay pool cannot supply a full job sample")
 
 var ErrManagerClosed = errors.New("job manager is closed")
@@ -69,7 +77,8 @@ type JobConfig struct {
 	// connected peer while both connected and unconnected candidates
 	// remain in the attempt's draw. 0 always prefers unconnected, 1 always
 	// connected. Negative disables the rule (evaluation control); above 1
-	// is rejected. The zero value 0.0 is the default bias
+	// is rejected. The zero value 0.0 is the default bias. Evaluation
+	// lever only; the design does not touch it
 	InitiatorEdgeEpsilon float64
 	// PeerState feeds the bias and its diagnostics; nil disables both.
 	// NewService fills it from the host
@@ -94,9 +103,10 @@ type PeerState interface {
 
 // JobManager is the initiator role: launches jobs as k branches, gives
 // every branch until the attempt timer to answer, settles on the merged
-// answers (mergeAnswers) or retransmits once when none arrived. One timer
-// and one SURB ledger (<= 2·k·m IDs) per job; every settle path deletes
-// the job with all its store entries
+// answers (mergeAnswers) or retransmits once when no branch produced an
+// OK answer. One timer and at most k·m live SURB entries per job, since
+// the retry replaces the first attempt's; every settle path deletes the
+// job with all its store entries
 type JobManager struct {
 	sender       PacketSender
 	km           *KeyManager
@@ -132,23 +142,36 @@ type discoveryJob struct {
 	// Written under mu at registration; the retransmit callback is the
 	// only later writer
 	relays map[peer.ID]struct{}
-	// append-only ledger of all SURB IDs, both attempts; scrub deletes
-	// exactly this set when the job ends
+	// the branch proxies of every attempt of this job; mergeAnswers sorts
+	// them to the end of the provider list
+	proxies map[peer.ID]struct{}
+	// ledger of the current attempt's SURB IDs; the retry commit clears
+	// the first attempt's share, scrub deletes what remains when the job
+	// ends
 	surbIDs []SURBID
-	// quorum bookkeeping, guarded by mu: every SURB maps to its branch
-	// (indices run across attempts), branches counts what was launched,
+	// quorum bookkeeping for the current attempt, guarded by mu: every
+	// SURB maps to its branch, branches counts what was launched,
 	// deadBranches what failed at send and can never answer. Each branch
 	// answers at most once: an OK list lands in okLists, a Failed answer
-	// bumps failedBranches, an undecodable one only answeredBranches
-	branchOf         map[SURBID]int
-	branches         int
-	deadBranches     int
-	answeredBranches int
-	failedBranches   int
-	okLists          [][]peer.AddrInfo
-	// the currently armed attempt timer; the retransmit swaps it under mu
-	timer  *time.Timer
-	result chan JobResult
+	// bumps failedBranches. An undecodable copy is no answer, it only
+	// consumes its envelope (counted per branch in invalidOf); a branch
+	// whose every envelope went to garbage is exhausted, nothing of it can
+	// arrive anymore, and counts toward the quorum like an answered one
+	branchOf          map[SURBID]int
+	invalidOf         map[int]int
+	branches          int
+	deadBranches      int
+	answeredBranches  int
+	failedBranches    int
+	exhaustedBranches int
+	okLists           [][]peer.AddrInfo
+	// the currently armed attempt timer; the retransmit swaps it under mu.
+	// timerGen ties each armed timer to its attempt: a callback whose
+	// generation no longer matches fired for a replaced attempt and is
+	// ignored
+	timer    *time.Timer
+	timerGen uint64
+	result   chan JobResult
 }
 
 // branch is one built forward path: packet for its first hop plus the SURB
@@ -215,8 +238,9 @@ func (jm *JobManager) sampleSize() int { return jm.k * jm.branchGroupSize() }
 // path to its own proxy plus m return paths, drawn in one sample so all
 // relays are distinct. The buffered channel receives exactly one JobResult
 // and is closed. Every branch gets until the attempt timer to answer; the
-// job settles early once all have (merged via mergeAnswers), at the timer
-// on whatever arrived, and with no answer at all the timer triggers one
+// job settles early once all have (merged via mergeAnswers) and at the
+// timer on whatever arrived. A first attempt without one OK answer, its
+// branches Failed, dead at send, or silent into the timer, triggers one
 // retransmit over fresh branches. ctx bounds only the first attempt's
 // sends
 func (jm *JobManager) StartJob(ctx context.Context, c cid.Cid) (<-chan JobResult, error) {
@@ -247,11 +271,13 @@ func (jm *JobManager) StartJob(ctx context.Context, c cid.Cid) (<-chan JobResult
 	// register and arm the timer before sending: a reply can arrive while
 	// SendPacket still blocks
 	j := &discoveryJob{
-		cid:      c,
-		attempt:  1,
-		relays:   make(map[peer.ID]struct{}, 2*need),
-		branchOf: make(map[SURBID]int, 2*jm.k*jm.m),
-		result:   make(chan JobResult, 1),
+		cid:       c,
+		attempt:   1,
+		relays:    make(map[peer.ID]struct{}, 2*need),
+		proxies:   make(map[peer.ID]struct{}, 2*jm.k),
+		branchOf:  make(map[SURBID]int, 2*jm.k*jm.m),
+		invalidOf: make(map[int]int, jm.k),
+		result:    make(chan JobResult, 1),
 	}
 	jm.mu.Lock()
 	if jm.closed {
@@ -264,23 +290,19 @@ func (jm *JobManager) StartJob(ctx context.Context, c cid.Cid) (<-chan JobResult
 	jm.registerAttemptLocked(j, draw, branches)
 	jm.mu.Unlock()
 
+	jm.metrics.JobsStarted.Add(1)
 	sent := 0
 	for _, b := range branches {
 		if jm.sendBranch(ctx, b) {
 			sent++
 		}
 	}
-	if sent == 0 {
-		// no packet in flight, no reply can come; fail fast
-		if j, ok := jm.removeByJob(j.id); ok {
-			jm.scrub(j)
-		}
-		return nil, fmt.Errorf("sending discovery job: all %d branch sends failed", len(branches))
-	}
+	// dead branches leave the quorum; a first attempt with every branch
+	// dead retries through the same path as one whose branches all
+	// answered Failed
 	if dead := len(branches) - sent; dead > 0 {
 		jm.markBranchesDead(j, dead)
 	}
-	jm.metrics.JobsStarted.Add(1)
 	return j.result, nil
 }
 
@@ -295,10 +317,14 @@ func (jm *JobManager) markBranchesDead(j *discoveryJob, n int) {
 		return
 	}
 	j.deadBranches += n
-	settled, res := jm.quorumLocked(j)
+	outcome, res := jm.quorumLocked(j)
 	jm.mu.Unlock()
-	if settled {
+	switch outcome {
+	case quorumSettled:
 		jm.settleQuorum(j, res)
+	case quorumRetry:
+		// off the caller's goroutine: the retransmit draws, builds and sends
+		go jm.retransmit(j)
 	}
 }
 
@@ -422,14 +448,15 @@ func (jm *JobManager) drawAttempt(c cid.Cid, exclude map[peer.ID]struct{}) []Key
 // union of all providers, ranked by how many branches named them
 // (independent confirmations first, which is what blunts a single lying
 // proxy), ties in arrival order. A peer named twice by one branch counts
-// once; addresses are the deduplicated union
-func mergeAnswers(lists [][]peer.AddrInfo) []peer.AddrInfo {
-	if len(lists) == 1 {
-		return lists[0]
-	}
+// once; addresses are the deduplicated union. A proxy of this job sorts
+// behind every other provider whatever its confirmations, since retrieving
+// from it lets it link the discovery it ran to the requester. Demoted
+// rather than dropped: a proxy can be the only provider of the CID
+func mergeAnswers(lists [][]peer.AddrInfo, proxies map[peer.ID]struct{}) []peer.AddrInfo {
 	type slot struct {
 		ai        peer.AddrInfo
 		count     int
+		isProxy   bool
 		seenAddrs map[string]struct{}
 	}
 	var order []*slot
@@ -439,7 +466,8 @@ func mergeAnswers(lists [][]peer.AddrInfo) []peer.AddrInfo {
 		for _, p := range list {
 			s, ok := byID[p.ID]
 			if !ok {
-				s = &slot{ai: peer.AddrInfo{ID: p.ID}, seenAddrs: make(map[string]struct{})}
+				_, isProxy := proxies[p.ID]
+				s = &slot{ai: peer.AddrInfo{ID: p.ID}, isProxy: isProxy, seenAddrs: make(map[string]struct{})}
 				byID[p.ID] = s
 				order = append(order, s)
 			}
@@ -457,7 +485,12 @@ func mergeAnswers(lists [][]peer.AddrInfo) []peer.AddrInfo {
 			}
 		}
 	}
-	sort.SliceStable(order, func(a, b int) bool { return order[a].count > order[b].count })
+	sort.SliceStable(order, func(a, b int) bool {
+		if order[a].isProxy != order[b].isProxy {
+			return !order[a].isProxy
+		}
+		return order[a].count > order[b].count
+	})
 	out := make([]peer.AddrInfo, len(order))
 	for i, s := range order {
 		out[i] = s.ai
@@ -624,9 +657,10 @@ func (jm *JobManager) shuffleInts(s []int) {
 }
 
 // registerAttemptLocked adds one attempt: SURB ledger, reply map, store
-// keys, relay set, timer. Map registration and store Put must share the
-// critical section (lock order mu -> SURBStore.mu): a reply can settle the
-// job at any instant, and a Put after the settling scrub would leak
+// keys, relay and proxy set, timer. Map registration and store Put must
+// share the critical section (lock order mu -> SURBStore.mu): a reply can
+// settle the job at any instant, and a Put after the settling scrub would
+// leak
 func (jm *JobManager) registerAttemptLocked(j *discoveryJob, draw []KeyInfo, branches []branch) {
 	for bi, b := range branches {
 		for i, id := range b.surbIDs {
@@ -640,17 +674,37 @@ func (jm *JobManager) registerAttemptLocked(j *discoveryJob, draw []KeyInfo, bra
 	for _, ki := range draw {
 		j.relays[ki.PeerID] = struct{}{}
 	}
+	for _, proxy := range jm.branchProxies(draw) {
+		j.proxies[proxy.PeerID] = struct{}{}
+	}
 	jm.recordProxyCPLs(j.cid, draw)
-	j.timer = time.AfterFunc(jm.timeout, func() { jm.onTimer(j.id) })
+	jm.armTimerLocked(j)
+}
+
+// armTimerLocked arms the attempt timer under mu; the captured generation
+// lets onTimer recognize a callback whose attempt has been replaced
+func (jm *JobManager) armTimerLocked(j *discoveryJob) {
+	j.timerGen++
+	gen := j.timerGen
+	j.timer = time.AfterFunc(jm.timeout, func() { jm.onTimer(j.id, gen) })
+}
+
+// branchProxies picks the exit slot out of every branch group of a
+// full-length attempt draw
+func (jm *JobManager) branchProxies(draw []KeyInfo) []KeyInfo {
+	g := jm.branchGroupSize()
+	proxies := make([]KeyInfo, jm.k)
+	for bi := range jm.k {
+		proxies[bi] = draw[bi*g+NrHops-1]
+	}
+	return proxies
 }
 
 // recordProxyCPLs: per branch proxy the CPL to the CID's provider key,
 // recorded at every attempt (ℓ = 0 included, as baseline)
 func (jm *JobManager) recordProxyCPLs(c cid.Cid, draw []KeyInfo) {
 	target := providerKeyID(c)
-	g := jm.branchGroupSize()
-	for bi := range jm.k {
-		proxy := draw[bi*g+NrHops-1]
+	for _, proxy := range jm.branchProxies(draw) {
 		cpl := kb.CommonPrefixLen(kb.ConvertPeerID(proxy.PeerID), target)
 		jm.metrics.ProxyCPLSum.Add(uint64(cpl))
 		jm.metrics.ProxyCPLCount.Add(1)
@@ -668,29 +722,26 @@ func (jm *JobManager) sendBranch(ctx context.Context, b branch) bool {
 	return true
 }
 
-// answer kinds a branch can contribute
+// answer kinds a branch can contribute; an undecodable payload is no
+// answer at all (consumeInvalid)
 type answerKind int
 
 const (
 	answerOK answerKind = iota
 	answerFailed
-	// decodable garbage; the payload is authenticated with initiator-held
-	// keys, so it can only come from the branch's own proxy: the branch
-	// has answered, just uselessly
-	answerInvalid
 )
 
 // HandleSURBReply is the single arbitration site. Every branch gets one
 // answer; the job settles as soon as all launched branches have answered
-// (or died at send), merging the OK lists via mergeAnswers. A branch that
-// stays silent keeps the job open until its attempt timer, which then
-// settles on the answers at hand or, with none, fires the retransmit
+// (or died at send, or exhausted their envelopes), merging the OK lists
+// via mergeAnswers. A branch that stays silent keeps the job open until
+// its attempt timer, which then settles on the answers at hand or, with
+// none, fires the retransmit
 func (jm *JobManager) HandleSURBReply(id SURBID, payload []byte) {
 	reply, err := DecodeReply(payload)
 	if err != nil {
-		jm.metrics.RepliesInvalid.Add(1)
 		log.Debugw("discarding undecodable surb reply", "surb", fmt.Sprintf("%x", id), "error", err)
-		jm.answerBranch(id, answerInvalid, nil)
+		jm.consumeInvalid(id)
 		return
 	}
 	if reply.Status == ReplyStatusFailed {
@@ -701,6 +752,44 @@ func (jm *JobManager) HandleSURBReply(id SURBID, payload []byte) {
 	}
 	if jm.answerBranch(id, answerOK, reply.Providers) {
 		jm.metrics.RepliesCollected.Add(1)
+	}
+}
+
+// consumeInvalid retires the envelope an undecodable reply arrived
+// through. The payload is authenticated garbage, so it can only come from
+// the branch's own proxy; still it does not settle the branch: the
+// remaining envelopes stay registered and a valid copy may yet answer.
+// Only when the last envelope goes to garbage is the branch exhausted,
+// and by envelope accounting rather than by trusting the garbage: no copy
+// can arrive anymore, so it joins the quorum like an answered branch
+func (jm *JobManager) consumeInvalid(id SURBID) {
+	jm.mu.Lock()
+	jobID, ok := jm.bySURB[id]
+	if !ok {
+		jm.mu.Unlock()
+		jm.metrics.RepliesDuplicate.Add(1)
+		log.Debugw("ignoring surb reply without a pending branch", "surb", fmt.Sprintf("%x", id))
+		return
+	}
+	j := jm.jobs[jobID]
+	delete(jm.bySURB, id)
+	bi := j.branchOf[id]
+	j.invalidOf[bi]++
+	var outcome quorumOutcome
+	var res JobResult
+	if j.invalidOf[bi] == jm.m {
+		j.exhaustedBranches++
+		outcome, res = jm.quorumLocked(j)
+	}
+	jm.mu.Unlock()
+	jm.surbs.Delete(id)
+	jm.metrics.RepliesInvalid.Add(1)
+	switch outcome {
+	case quorumSettled:
+		jm.settleQuorum(j, res)
+	case quorumRetry:
+		// off the delivery goroutine: the retransmit draws, builds and sends
+		go jm.retransmit(j)
 	}
 }
 
@@ -735,38 +824,92 @@ func (jm *JobManager) answerBranch(id SURBID, kind answerKind, providers []peer.
 	case answerFailed:
 		j.failedBranches++
 	}
-	settled, res := jm.quorumLocked(j)
+	outcome, res := jm.quorumLocked(j)
 	jm.mu.Unlock()
 
 	// idempotent against a concurrent settle's scrub
 	for _, sid := range stale {
 		jm.surbs.Delete(sid)
 	}
-	if settled {
+	switch outcome {
+	case quorumSettled:
 		jm.settleQuorum(j, res)
+	case quorumRetry:
+		// off the delivery goroutine: the retransmit draws, builds and sends
+		go jm.retransmit(j)
 	}
 	return true
 }
 
-// quorumLocked checks whether every launched branch has answered or died;
-// if so it removes the job from the maps and builds the result. Caller
-// holds mu
-func (jm *JobManager) quorumLocked(j *discoveryJob) (bool, JobResult) {
-	if j.answeredBranches+j.deadBranches < j.branches {
-		return false, JobResult{}
+// quorum outcomes: the job stays open, settles on the collected answers,
+// or has spent its first attempt without one OK answer and retries
+type quorumOutcome int
+
+const (
+	quorumOpen quorumOutcome = iota
+	quorumSettled
+	quorumRetry
+)
+
+// quorumLocked checks whether every launched branch has answered, died or
+// exhausted its envelopes. With an OK answer at hand, or no retry left,
+// it removes the job from the maps and builds the result; a first attempt
+// whose branches all answered Failed, died or exhausted commits the retry
+// instead: reported failure retries like silence, and with every branch
+// accounted for there is nothing left to wait for. Caller holds mu; on
+// quorumRetry it follows up with retransmit off the lock
+func (jm *JobManager) quorumLocked(j *discoveryJob) (quorumOutcome, JobResult) {
+	if j.branches == 0 || j.answeredBranches+j.deadBranches+j.exhaustedBranches < j.branches {
+		return quorumOpen, JobResult{}
+	}
+	if len(j.okLists) == 0 && j.attempt == 1 && !jm.noRetransmit {
+		jm.commitRetryLocked(j)
+		return quorumRetry, JobResult{}
 	}
 	jm.unregisterLocked(j)
-	return true, resultOf(j)
+	return quorumSettled, resultOf(j)
+}
+
+// commitRetryLocked switches j to its second and final attempt and
+// invalidates the first attempt's timer; the bumped generation covers a
+// timer that has already fired and is waiting on mu. The first attempt
+// ends here, so its branch groups leave the SURB table and its quorum
+// counters reset: a reply the retry overtook is dropped as a duplicate,
+// and the retry settles on its own k branches. The relay and proxy
+// ledgers survive, the retry's draw and the merge demotion need the whole
+// job's history. Caller holds mu
+func (jm *JobManager) commitRetryLocked(j *discoveryJob) {
+	j.attempt = 2
+	j.timerGen++
+	if j.timer != nil {
+		j.timer.Stop()
+	}
+	for _, sid := range j.surbIDs {
+		delete(jm.bySURB, sid)
+		jm.surbs.Delete(sid)
+		delete(j.branchOf, sid)
+	}
+	j.surbIDs = j.surbIDs[:0]
+	clear(j.invalidOf)
+	j.branches, j.deadBranches, j.answeredBranches, j.failedBranches, j.exhaustedBranches = 0, 0, 0, 0, 0
+	j.okLists = nil
 }
 
 // resultOf: any OK answer makes the job a success on the merged lists;
-// otherwise every answer was Failed (or authenticated garbage), which is
-// a reported discovery failure, not a timeout
+// otherwise a Failed answer means a proxy reported a discovery failure,
+// exhausted branches delivered only garbage, and without either every
+// launched branch died at send
 func resultOf(j *discoveryJob) JobResult {
 	if len(j.okLists) > 0 {
-		return JobResult{Providers: mergeAnswers(j.okLists)}
+		return JobResult{Providers: mergeAnswers(j.okLists, j.proxies)}
 	}
-	return JobResult{Err: ErrDiscoveryFailed}
+	if j.failedBranches > 0 {
+		return JobResult{Err: ErrDiscoveryFailed}
+	}
+	if j.exhaustedBranches > 0 {
+		return JobResult{Err: ErrInvalidReplies}
+	}
+	return JobResult{Err: ErrSendFailed}
 }
 
 // settleQuorum settles a job already removed from the maps and books the
@@ -782,12 +925,14 @@ func (jm *JobManager) settleQuorum(j *discoveryJob, res JobResult) {
 
 // onTimer ends the waiting for silent branches: with at least one OK
 // answer at hand the job settles on it (a lone answer is a result, only
-// the chance for the others ends), with none the first timer fires the
-// retransmit and the second settles as ErrJobTimeout
-func (jm *JobManager) onTimer(jobID uint64) {
+// the chance for the others ends), with none the first timer commits the
+// retransmit and the second settles as ErrJobTimeout. A stale generation
+// means the attempt was replaced while this callback fired; the new
+// attempt runs under its own timer
+func (jm *JobManager) onTimer(jobID uint64, gen uint64) {
 	jm.mu.Lock()
 	j, ok := jm.jobs[jobID]
-	if !ok {
+	if !ok || gen != j.timerGen {
 		jm.mu.Unlock()
 		return
 	}
@@ -799,6 +944,7 @@ func (jm *JobManager) onTimer(jobID uint64) {
 		return
 	}
 	if j.attempt == 1 && !jm.noRetransmit {
+		jm.commitRetryLocked(j)
 		jm.mu.Unlock()
 		jm.retransmit(j)
 		return
@@ -809,11 +955,12 @@ func (jm *JobManager) onTimer(jobID uint64) {
 	jm.settle(j, JobResult{Err: ErrJobTimeout})
 }
 
-// retransmit is the second and final attempt: fresh draw (avoiding the
-// first attempt's relays when the pool allows), k new branches, one final
-// timer. First-attempt SURBs stay registered so a late reply still wins.
-// If even the unrestricted draw is short, no second wave; the final timer
-// covers the first attempt's SURBs alone
+// retransmit runs the second and final attempt after the caller committed
+// it under mu: fresh draw (avoiding the first attempt's relays when the
+// pool allows), k new branches, one final timer. If even the unrestricted
+// draw is short there is no second wave and the job settles on the
+// shortfall: the commit already ended the first attempt, so no reply can
+// arrive anymore
 func (jm *JobManager) retransmit(j *discoveryJob) {
 	need := jm.sampleSize()
 	draw := jm.drawAttempt(j.cid, j.relays)
@@ -835,12 +982,14 @@ func (jm *JobManager) retransmit(j *discoveryJob) {
 		jm.mu.Unlock()
 		return
 	}
-	j.attempt = 2
 	if err != nil {
-		j.timer = time.AfterFunc(jm.timeout, func() { jm.onTimer(j.id) })
+		// the commit already dropped the first attempt's SURBs, so nothing
+		// can arrive anymore; the job settles on the error at once
+		jm.unregisterLocked(j)
 		jm.mu.Unlock()
 		jm.metrics.RetransmitsFailed.Add(1)
-		log.Debugw("retransmit degraded to waiting out the final timer", "cid", j.cid, "error", err)
+		log.Debugw("retransmit impossible, settling the job", "cid", j.cid, "error", err)
+		jm.settleQuorum(j, JobResult{Err: fmt.Errorf("retransmit: %w", err)})
 		return
 	}
 	jm.registerAttemptLocked(j, draw, branches)
@@ -862,19 +1011,6 @@ func (jm *JobManager) retransmit(j *discoveryJob) {
 	}
 }
 
-// removeByJob claims a job by ID: job and all its SURB mappings leave the
-// maps in one critical section
-func (jm *JobManager) removeByJob(jobID uint64) (*discoveryJob, bool) {
-	jm.mu.Lock()
-	defer jm.mu.Unlock()
-	j, ok := jm.jobs[jobID]
-	if !ok {
-		return nil, false
-	}
-	jm.unregisterLocked(j)
-	return j, true
-}
-
 func (jm *JobManager) unregisterLocked(j *discoveryJob) {
 	delete(jm.jobs, j.id)
 	for _, sid := range j.surbIDs {
@@ -883,8 +1019,8 @@ func (jm *JobManager) unregisterLocked(j *discoveryJob) {
 }
 
 // scrub stops the timer and deletes the job's whole SURB ledger, used or
-// not. Callers own j exclusively (claimed via quorumLocked/removeByJob/
-// Close), so no lock
+// not. Callers own j exclusively (claimed via quorumLocked/Close), so no
+// lock
 func (jm *JobManager) scrub(j *discoveryJob) {
 	if j.timer != nil {
 		j.timer.Stop()

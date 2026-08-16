@@ -108,6 +108,7 @@ type Session struct {
 	pm             PeerManager
 	sprm           SessionPeerManager
 	providerFinder routing.ContentDiscovery
+	noBroadcast    bool
 	sim            *bssim.SessionInterestManager
 
 	sw  sessionWants
@@ -143,6 +144,10 @@ type Session struct {
 // used to track provider discovery, connection attempts, and data retrieval
 // phases. This is particularly useful for debugging timeout errors and
 // understanding retrieval performance.
+//
+// A session created with noBroadcast never sends want-have broadcasts to
+// connected peers; it queries providerFinder for the first want right away
+// and relies on it exclusively for discovery.
 func New(
 	ctx context.Context,
 	sm SessionManager,
@@ -157,6 +162,7 @@ func New(
 	periodicSearchDelay time.Duration,
 	self peer.ID,
 	havesReceivedGauge bspm.Gauge,
+	noBroadcast bool,
 ) *Session {
 	ctx, cancel := context.WithCancel(ctx)
 
@@ -169,6 +175,7 @@ func New(
 		pm:                  pm,
 		sprm:                sprm,
 		providerFinder:      providerFinder,
+		noBroadcast:         noBroadcast,
 		sim:                 sim,
 		incoming:            make(chan op, 128),
 		latencyTrkr:         latencyTracker{},
@@ -494,14 +501,25 @@ func (s *Session) wantBlocks(ctx context.Context, newks []cid.Cid) {
 
 	// No peers discovered yet, broadcast some want-haves
 	ks := s.sw.GetNextWants()
-	if len(ks) > 0 {
-		log.Infow("No peers - broadcasting", "session", s.id, "want-count", len(ks))
-		s.broadcastWantHaves(ctx, ks)
+	if len(ks) == 0 {
+		return
 	}
+	if s.noBroadcast {
+		// no broadcast to lean on, so start the provider lookup right away
+		s.findMorePeers(ctx, ks[0])
+		return
+	}
+	log.Infow("No peers - broadcasting", "session", s.id, "want-count", len(ks))
+	s.broadcastWantHaves(ctx, ks)
 }
 
-// broadcastWantHaves sends want-haves to all connected peers.
+// broadcastWantHaves sends want-haves to all connected peers. A
+// no-broadcast session drops them; its only discovery path is the
+// provider finder.
 func (s *Session) broadcastWantHaves(ctx context.Context, wants []cid.Cid) {
+	if s.noBroadcast {
+		return
+	}
 	log.Debugw("broadcastWantHaves", "session", s.id, "cids", wants)
 	s.pm.BroadcastWantHaves(wants)
 }

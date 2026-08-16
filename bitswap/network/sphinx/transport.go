@@ -41,10 +41,11 @@ type PeerFinder interface {
 // initiator (always a relay-set member) receives its own SURB replies; a
 // client-mode node keeps it unmounted (setServing).
 //
-// With a finder, every send is preceded by one FindPeer for the next hop,
-// known or not. All roles send through here, so initiator, relay and proxy
-// hops behave identically: a hop that had to resolve its successor is
-// indistinguishable from one that already knew it
+// With a finder, every dial is preceded by one FindPeer for the next hop,
+// cached address or not; sends to already connected peers ride the
+// standing connection without a lookup. All roles send through here, so
+// initiator, relay and proxy hops behave identically: a hop that had to
+// resolve its successor is indistinguishable from one that already knew it
 type Transport struct {
 	host      host.Host
 	relay     *Relay
@@ -150,12 +151,15 @@ func (t *Transport) SendPacket(ctx context.Context, next peer.ID, pkt []byte) er
 	return s.Close()
 }
 
-// lookupNextHop runs the pre-send FindPeer, unconditionally: fresh
-// addresses ride in for free and every hop pays the same lookup whether it
-// knows the next one or not. Failure is fine, the dial decides
-// deliverability
+// lookupNextHop runs the pre-dial FindPeer. A standing connection skips
+// it: those sends never dial, so there is nothing to normalize (the
+// connection may still drop before NewStream; that dial then runs on
+// cached addresses). Failure is fine, the dial decides deliverability
 func (t *Transport) lookupNextHop(ctx context.Context, next peer.ID) {
 	if t.finder == nil {
+		return
+	}
+	if t.host.Network().Connectedness(next) == network.Connected {
 		return
 	}
 	lctx, cancel := context.WithTimeout(ctx, relayTimeout)

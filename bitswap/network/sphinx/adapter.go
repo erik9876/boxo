@@ -75,7 +75,15 @@ func (f *ProviderFinder) FindProvidersAsync(ctx context.Context, c cid.Cid, coun
 //	    providerquerymanager.WithMaxTimeout(sphinx.SuggestedFinderTimeout(cfg.Job)),
 //	    providerquerymanager.WithMaxProviders(sphinx.MaxProvidersPerReply))
 //	bs := bitswap.New(ctx, net, pqm, bstore,
-//	    client.WithDefaultProviderQueryManager(false))
+//	    client.WithDefaultProviderQueryManager(false),
+//	    client.BroadcastControlEnable(true),
+//	    client.BroadcastControlMaxPeers(0))
+//
+// The BroadcastControl pair matters once blocks are fetched through
+// sessions: without it every want also leaves as a plaintext WANT-HAVE
+// broadcast to all connected peers, ahead of the sphinx lookup. For
+// per-session instead of client-wide suppression, fetch through
+// client.NewSessionWithOptions with client.WithAnonymousDiscovery(pqm).
 func SuggestedFinderTimeout(cfg JobConfig) time.Duration {
 	t := cfg.Timeout
 	if t == 0 {
