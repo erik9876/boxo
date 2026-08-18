@@ -18,9 +18,12 @@ const (
 	ReturnPathsPerJob = 3
 )
 
-// Geometry returns the single network-wide Sphinx geometry
+// Geometry returns the single network-wide Sphinx geometry.
+// withSURB is false: replies travel through the SURBs carried inside
+// the user payload, so katzenpost's extra per-packet SURB slot would
+// only add 410 B of dead padding
 func Geometry() *geo.Geometry {
 	scheme := x25519.Scheme(rand.Reader)
 	return geo.GeometryFromUserForwardPayloadLength(
-		scheme, UserPayloadLength, true, NrHops)
+		scheme, UserPayloadLength, false, NrHops)
 }

@@ -100,8 +100,9 @@ func NewReplyFromSURB(surb, payload []byte) ([]byte, peer.ID, error) {
 
 // padPayload frames payload to exactly size bytes: length prefix, payload,
 // zero padding. katzenpost requires exactly ForwardPayloadLength, and the
-// uniform size keeps lengths from leaking content. Capacity here (~2456 B)
-// is above the 2048 B user budget; the job codec enforces the budget
+// uniform size keeps lengths from leaking content. The prefix puts
+// capacity (2046 B) 2 B under the 2048 B user budget; the geometry pin
+// test proves every worst-case message fits the wire
 func padPayload(payload []byte, size int) ([]byte, error) {
 	if len(payload) > size-payloadLenPrefix {
 		return nil, fmt.Errorf("payload of %d bytes exceeds capacity %d", len(payload), size-payloadLenPrefix)

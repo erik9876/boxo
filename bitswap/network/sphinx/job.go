@@ -11,8 +11,8 @@ import (
 )
 
 // Job and reply codec for the payloads of the packet core. Both encodings
-// check against the 2048 B UserPayloadLength budget, not the ~2456 B
-// padding capacity (see padPayload)
+// check against the 2048 B UserPayloadLength budget; the wire capacity
+// sits 2 B under it (see padPayload), the geometry pin test covers the gap
 
 // 0x00 stays invalid so a zeroed buffer never parses as a job
 const cmdDiscoverV1 byte = 0x01
