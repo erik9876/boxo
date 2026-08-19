@@ -55,6 +55,22 @@ type JobResult struct {
 	Err       error
 }
 
+// DrawPolicy selects how an attempt's relays come out of the pool
+type DrawPolicy int
+
+const (
+	// DrawExclusive is the default: one sample without replacement makes
+	// all relays of an attempt pairwise distinct, and the retransmit
+	// excludes the first attempt's relays where the pool allows it
+	DrawExclusive DrawPolicy = iota
+	// DrawIndependent draws every relay slot as an independent uniform
+	// pick with replacement. Only two rules survive: the k proxies stay
+	// pairwise distinct, and no drawn node is asked to dial itself. The
+	// retransmit repeats the same draw without excluding the first
+	// attempt. Evaluation arm; see drawIndependent
+	DrawIndependent
+)
+
 type JobConfig struct {
 	// Timeout bounds one attempt; zero means DefaultJobTimeout
 	Timeout time.Duration
@@ -71,6 +87,9 @@ type JobConfig struct {
 	MinProxyCPL int
 	// DisableRetransmit limits a job to a single attempt (evaluation seam)
 	DisableRetransmit bool
+	// Draw selects the relay draw policy; the zero value DrawExclusive is
+	// the without-replacement default. See DrawPolicy
+	Draw DrawPolicy
 	// InitiatorEdgeEpsilon steers the connection bias on relay slots whose
 	// observed neighbor is the initiator (forward first hop and the last
 	// relay of each return path): per such slot, the probability of a
@@ -120,6 +139,7 @@ type JobManager struct {
 	k            int
 	minCPL       int
 	noRetransmit bool
+	draw         DrawPolicy
 	epsilon      float64
 	state        PeerState
 	// nil disables the gate; NewService fills it from the key exchange
@@ -142,9 +162,10 @@ type discoveryJob struct {
 	cid cid.Cid
 	// 1 until the retransmit commits, then 2; guarded by mu
 	attempt int
-	// every relay drawn for this job, excluded by the retransmit draw.
-	// Written under mu at registration; the retransmit callback is the
-	// only later writer
+	// every relay drawn for this job, excluded by the exclusive policy's
+	// retransmit draw (the independent draw ignores the ledger; as a set
+	// it also collapses its repeats). Written under mu at registration;
+	// the retransmit callback is the only later writer
 	relays map[peer.ID]struct{}
 	// the branch proxies of every attempt of this job; mergeAnswers sorts
 	// them to the end of the provider list
@@ -209,6 +230,12 @@ func NewJobManager(sender PacketSender, km *KeyManager, pool *KeyStore, surbs *S
 	if cfg.InitiatorEdgeEpsilon > 1 {
 		return nil, errors.New("initiator edge epsilon must be at most 1 (negative disables the bias)")
 	}
+	if cfg.Draw != DrawExclusive && cfg.Draw != DrawIndependent {
+		return nil, errors.New("draw policy must be DrawExclusive or DrawIndependent")
+	}
+	if cfg.Draw == DrawIndependent && cfg.PeerState != nil && cfg.InitiatorEdgeEpsilon >= 0 {
+		return nil, errors.New("initiator edge bias cannot run on the independent draw: its permutation could join repeated peers into adjacent slots (set the epsilon negative)")
+	}
 	return &JobManager{
 		sender:       sender,
 		km:           km,
@@ -219,6 +246,7 @@ func NewJobManager(sender PacketSender, km *KeyManager, pool *KeyStore, surbs *S
 		k:            cfg.Branches,
 		minCPL:       cfg.MinProxyCPL,
 		noRetransmit: cfg.DisableRetransmit,
+		draw:         cfg.Draw,
 		epsilon:      cfg.InitiatorEdgeEpsilon,
 		state:        cfg.PeerState,
 		serving:      cfg.ServingCheck,
@@ -380,9 +408,11 @@ func (jm *JobManager) settle(j *discoveryJob, res JobResult) {
 }
 
 // buildBranches splits draw into k groups and builds one branch per group.
-// Sampling without replacement already gives the path invariants: no proxy
-// on its own return paths, disjoint return paths, first forward relay !=
-// last return relay
+// Under the exclusive draw, sampling without replacement already gives the
+// path invariants: no proxy on its own return paths, disjoint return
+// paths, first forward relay != last return relay. The independent draw
+// gives these invariants up deliberately and keeps only its own two rules
+// (distinct proxies, no self-dial); see drawIndependent
 func (jm *JobManager) buildBranches(c cid.Cid, draw []KeyInfo) ([]branch, error) {
 	jm.biasEdgeSlots(draw)
 	self := KeyInfo{PeerID: jm.km.PeerID(), PublicKey: jm.km.PublicKey()}
@@ -416,12 +446,18 @@ func (jm *JobManager) buildBranches(c cid.Cid, draw []KeyInfo) ([]branch, error)
 	return branches, nil
 }
 
-// drawAttempt draws the k·(NrHops+2m) relays of one attempt, minus exclude.
-// A short draw means pool shortfall; the caller decides. minCPL = 0 is one
-// uniform sample. Otherwise only the proxy slots are biased
-// (selectProxies); the other relays are a fresh uniform draw around them,
-// keeping the attempt disjoint and the relay positions unbiased
+// drawAttempt draws the k·(NrHops+2m) relays of one attempt. A short draw
+// means pool shortfall; the caller decides. DrawIndependent dispatches to
+// drawIndependent, which ignores exclude by design (its retransmit
+// redraws uniformly). The rest describes the exclusive draw, minus
+// exclude: minCPL = 0 is one uniform sample. Otherwise only the proxy
+// slots are biased (selectProxies); the other relays are a fresh uniform
+// draw around them, keeping the attempt disjoint and the relay positions
+// unbiased
 func (jm *JobManager) drawAttempt(c cid.Cid, exclude map[peer.ID]struct{}) []KeyInfo {
+	if jm.draw == DrawIndependent {
+		return jm.drawIndependent(c)
+	}
 	need := jm.sampleSize()
 	if jm.minCPL == 0 {
 		return jm.pool.SampleExcluding(need, exclude)
@@ -456,6 +492,82 @@ func (jm *JobManager) drawAttempt(c cid.Cid, exclude map[peer.ID]struct{}) []Key
 		draw = append(draw, proxies[bi])
 		draw = append(draw, relays[NrHops-1:g-1]...)
 		relays = relays[g-1:]
+	}
+	return draw
+}
+
+// drawIndependent draws one attempt for the DrawIndependent policy: every
+// slot an independent uniform pick from the live snapshot, with
+// replacement, so no slot constrains any other beyond two hard rules. The
+// k proxies stay pairwise distinct (ℓ = 0 rejects duplicate picks, which
+// is uniform over distinct k-tuples; ℓ > 0 reuses selectProxies, distinct
+// by construction), and no drawn node is asked to dial itself: each
+// forward slot differs from its predecessor and the last relay from its
+// proxy, each return path's first relay differs from the proxy that dials
+// it and its second from the first. A constrained slot redraws until
+// legal, which keeps it uniform over the pool minus its at most two
+// forbidden peers; the snapshot holds at least the attempt's demand, so
+// the redraws terminate. Admission matches the exclusive draw: fewer live
+// entries than sampleSize() report a shortfall even though independent
+// picks could stretch a smaller pool, keeping both policies' runs under
+// identical admission
+func (jm *JobManager) drawIndependent(c cid.Cid) []KeyInfo {
+	need := jm.sampleSize()
+	live := jm.pool.SampleExcluding(jm.pool.Len(), nil)
+	if len(live) < need {
+		return live
+	}
+
+	pick := func(forbidden ...peer.ID) KeyInfo {
+	redraw:
+		for {
+			ki := live[jm.rand(len(live))]
+			for _, pid := range forbidden {
+				if ki.PeerID == pid {
+					continue redraw
+				}
+			}
+			return ki
+		}
+	}
+
+	var proxies []KeyInfo
+	if jm.minCPL > 0 {
+		proxies = selectProxies(live, jm.k, jm.minCPL, providerKeyID(c))
+	} else {
+		seen := make(map[peer.ID]struct{}, jm.k)
+		for len(proxies) < jm.k {
+			ki := live[jm.rand(len(live))]
+			if _, dup := seen[ki.PeerID]; dup {
+				continue
+			}
+			seen[ki.PeerID] = struct{}{}
+			proxies = append(proxies, ki)
+		}
+	}
+
+	draw := make([]KeyInfo, 0, need)
+	for bi := range jm.k {
+		proxy := proxies[bi]
+		// the forward chain up to the proxy; prev starts empty because the
+		// initiator is never in the pool
+		var prev peer.ID
+		for i := range NrHops - 1 {
+			var ki KeyInfo
+			if i == NrHops-2 {
+				ki = pick(prev, proxy.PeerID)
+			} else {
+				ki = pick(prev)
+			}
+			draw = append(draw, ki)
+			prev = ki.PeerID
+		}
+		draw = append(draw, proxy)
+		for range jm.m {
+			s1 := pick(proxy.PeerID)
+			s2 := pick(s1.PeerID)
+			draw = append(draw, s1, s2)
+		}
 	}
 	return draw
 }
@@ -1014,8 +1126,15 @@ func (jm *JobManager) onTimer(jobID uint64, gen uint64) {
 // arrive anymore
 func (jm *JobManager) retransmit(j *discoveryJob) {
 	need := jm.sampleSize()
-	draw := jm.drawAttempt(j.cid, j.relays)
-	if len(draw) < need {
+	// only the exclusive draw avoids the first attempt's relays, with the
+	// unrestricted fallback when the exclusion would starve the pool; the
+	// independent policy redraws uniformly and needs neither
+	var exclude map[peer.ID]struct{}
+	if jm.draw == DrawExclusive {
+		exclude = j.relays
+	}
+	draw := jm.drawAttempt(j.cid, exclude)
+	if len(draw) < need && exclude != nil {
 		draw = jm.drawAttempt(j.cid, nil)
 	}
 	var branches []branch

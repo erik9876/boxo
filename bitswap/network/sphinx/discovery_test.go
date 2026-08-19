@@ -2235,6 +2235,45 @@ func TestNewJobManagerRejectsBadMinProxyCPL(t *testing.T) {
 	}
 }
 
+func TestNewJobManagerRejectsUnknownDrawPolicy(t *testing.T) {
+	idPriv, _ := newIdentity(t)
+	km, err := NewKeyManager(idPriv, time.Hour)
+	if err != nil {
+		t.Fatalf("NewKeyManager: %v", err)
+	}
+	if _, err := NewJobManager(&fakeSender{}, km, NewKeyStore(), NewSURBStore(), JobConfig{Draw: DrawPolicy(3)}); err == nil {
+		t.Fatal("NewJobManager accepted an unknown draw policy")
+	}
+}
+
+// the edge bias permutes relays across slots and could move a repeated
+// peer into adjacency, so the independent draw refuses an enabled bias;
+// the diagnostics-only sentinel and a stateless config stay legal
+func TestNewJobManagerRejectsEdgeBiasWithIndependentDraw(t *testing.T) {
+	idPriv, _ := newIdentity(t)
+	km, err := NewKeyManager(idPriv, time.Hour)
+	if err != nil {
+		t.Fatalf("NewKeyManager: %v", err)
+	}
+	state := mapPeerState{conn: map[peer.ID]network.Connectedness{}}
+	if _, err := NewJobManager(&fakeSender{}, km, NewKeyStore(), NewSURBStore(),
+		JobConfig{Draw: DrawIndependent, InitiatorEdgeEpsilon: 0.5, PeerState: state}); err == nil {
+		t.Fatal("NewJobManager accepted the edge bias on the independent draw")
+	}
+	if _, err := NewJobManager(&fakeSender{}, km, NewKeyStore(), NewSURBStore(),
+		JobConfig{Draw: DrawIndependent, InitiatorEdgeEpsilon: 0, PeerState: state}); err == nil {
+		t.Fatal("NewJobManager accepted the epsilon = 0 boundary on the independent draw")
+	}
+	if _, err := NewJobManager(&fakeSender{}, km, NewKeyStore(), NewSURBStore(),
+		JobConfig{Draw: DrawIndependent, InitiatorEdgeEpsilon: -1, PeerState: state}); err != nil {
+		t.Fatalf("NewJobManager rejected the diagnostics-only sentinel: %v", err)
+	}
+	if _, err := NewJobManager(&fakeSender{}, km, NewKeyStore(), NewSURBStore(),
+		JobConfig{Draw: DrawIndependent, InitiatorEdgeEpsilon: 0.5}); err != nil {
+		t.Fatalf("NewJobManager rejected the independent draw without a PeerState: %v", err)
+	}
+}
+
 // ℓ = 0 short-circuits to one uniform SampleExcluding over the pool; the
 // rest of the suite runs at that default and guards the equivalence.
 // Pinned here: full pool consumed pairwise distinct, exclusion honored,
@@ -2259,6 +2298,242 @@ func TestDrawAttemptLZeroIsUniformDraw(t *testing.T) {
 		if _, ok := exclude[ki.PeerID]; ok {
 			t.Errorf("excluded peer %s drawn anyway", ki.PeerID)
 		}
+	}
+}
+
+// assertIndependentDrawLegal checks the two hard rules of the independent
+// draw on one attempt: the k proxies are pairwise distinct and no drawn
+// node would dial itself (consecutive forward slots, each return path's
+// first relay against the proxy that dials it, consecutive return slots).
+// Everything else may repeat
+func assertIndependentDrawLegal(t *testing.T, draw []KeyInfo, k, m int) {
+	t.Helper()
+	g := NrHops + 2*m
+	proxies := make(map[peer.ID]struct{}, k)
+	for bi := range k {
+		base := bi * g
+		proxy := draw[base+NrHops-1]
+		if _, dup := proxies[proxy.PeerID]; dup {
+			t.Errorf("branch %d reuses proxy %s", bi, proxy.PeerID)
+		}
+		proxies[proxy.PeerID] = struct{}{}
+		for i := 1; i < NrHops; i++ {
+			if draw[base+i-1].PeerID == draw[base+i].PeerID {
+				t.Errorf("branch %d: forward slots %d and %d hold the same peer %s", bi, i-1, i, draw[base+i].PeerID)
+			}
+		}
+		for i := range m {
+			s1, s2 := draw[base+NrHops+2*i], draw[base+NrHops+2*i+1]
+			if s1.PeerID == proxy.PeerID {
+				t.Errorf("branch %d: return path %d starts at its own proxy %s", bi, i, proxy.PeerID)
+			}
+			if s1.PeerID == s2.PeerID {
+				t.Errorf("branch %d: return path %d holds the same peer %s twice in a row", bi, i, s1.PeerID)
+			}
+		}
+	}
+}
+
+func distinctRelays(draw []KeyInfo) int {
+	seen := make(map[peer.ID]struct{}, len(draw))
+	for _, ki := range draw {
+		seen[ki.PeerID] = struct{}{}
+	}
+	return len(seen)
+}
+
+// the independent draw keeps only the hard rules and otherwise repeats
+// freely: over a pool of exactly one attempt's demand, a draw without
+// replacement would consume every entry exactly once, while independent
+// picks repeat some peer with overwhelming probability
+func TestIndependentDrawKeepsRulesAndRepeats(t *testing.T) {
+	k, m := 2, ReturnPathsPerJob
+	need := jobSampleSize(k, m)
+	jm, _ := newTestJobManager(t, &fakeSender{}, need, JobConfig{Branches: k, Draw: DrawIndependent})
+
+	repeated := false
+	for range 40 {
+		draw := jm.drawAttempt(testCID(t), nil)
+		if len(draw) != need {
+			t.Fatalf("draw has %d relays, want %d", len(draw), need)
+		}
+		assertIndependentDrawLegal(t, draw, k, m)
+		if distinctRelays(draw) < need {
+			repeated = true
+		}
+	}
+	if !repeated {
+		t.Error("40 independent draws never repeated a relay; the draw behaves like sampling without replacement")
+	}
+}
+
+// admission stays the exclusive draw's: fewer live entries than one
+// attempt's demand refuse the job, even though independent picks could
+// stretch a smaller pool. Both policies admit under identical conditions,
+// which keeps their runs comparable
+func TestIndependentDrawReportsShortfall(t *testing.T) {
+	k, m := 2, ReturnPathsPerJob
+	need := jobSampleSize(k, m)
+	jm, _ := newTestJobManager(t, &fakeSender{}, need-1, JobConfig{Branches: k, Draw: DrawIndependent})
+
+	if _, err := jm.StartJob(context.Background(), testCID(t)); !errors.Is(err, ErrPoolTooSmall) {
+		t.Fatalf("StartJob returned %v, want ErrPoolTooSmall", err)
+	}
+}
+
+// the ℓ bias keeps working on the independent draw: proxies come from
+// selectProxies (pairwise distinct by construction), the relays around
+// them stay independent picks
+func TestIndependentDrawLBiasedProxies(t *testing.T) {
+	k, m := 2, 1
+	need := jobSampleSize(k, m)
+	jm, _ := newTestJobManager(t, &fakeSender{}, 3*need, JobConfig{Branches: k, ReturnPaths: m, MinProxyCPL: 256, Draw: DrawIndependent})
+	c := testCID(t)
+	want := nearestPeers(jm.pool.Sample(jm.pool.Len()), providerKeyID(c), k)
+
+	draw := jm.drawAttempt(c, nil)
+	if len(draw) != need {
+		t.Fatalf("draw has %d relays, want %d", len(draw), need)
+	}
+	assertIndependentDrawLegal(t, draw, k, m)
+	for _, p := range drawProxies(draw, k, jm.branchGroupSize()) {
+		if _, ok := want[p.PeerID]; !ok {
+			t.Errorf("proxy %s is not among the %d nearest peers", p.PeerID, k)
+		}
+	}
+}
+
+// under the independent policy the retransmit redraws the same way and
+// ignores the first attempt: over a pool of twice the demand, the two
+// attempts share some relay with overwhelming probability, so a fully
+// disjoint ledger would mean the exclusion is still active
+func TestIndependentRetransmitOverlapsFirstAttempt(t *testing.T) {
+	sender := &fakeSender{}
+	k, m := 2, ReturnPathsPerJob
+	need := jobSampleSize(k, m)
+	jm, _ := newTestJobManager(t, sender, 2*need, JobConfig{Branches: k, Timeout: 300 * time.Millisecond, Draw: DrawIndependent})
+
+	if _, err := jm.StartJob(context.Background(), testCID(t)); err != nil {
+		t.Fatalf("StartJob: %v", err)
+	}
+	waitFor(t, 5*time.Second, "the retransmit wave", func() bool { return jm.Metrics().Retransmits == 1 })
+	if met := jm.Metrics(); met.RetransmitsFailed != 0 {
+		t.Errorf("retransmit failed %d times, want 0", met.RetransmitsFailed)
+	}
+	if relays := jm.pendingJobRelays(t); len(relays) == 2*need {
+		t.Errorf("the two attempts drew %d pairwise-distinct relays; the independent redraw should overlap the first attempt", len(relays))
+	}
+}
+
+// drawAttempt under the independent policy ignores exclude by design (no
+// caller passes one, but the dispatcher must not honor one either): with
+// the entire pool excluded, the draw must still come back full. An
+// implementation that honored the exclusion would return an empty draw
+func TestIndependentDrawIgnoresExclude(t *testing.T) {
+	k, m := 2, ReturnPathsPerJob
+	need := jobSampleSize(k, m)
+	jm, _ := newTestJobManager(t, &fakeSender{}, need, JobConfig{Branches: k, Draw: DrawIndependent})
+
+	exclude := make(map[peer.ID]struct{}, need)
+	for _, ki := range jm.pool.Sample(jm.pool.Len()) {
+		exclude[ki.PeerID] = struct{}{}
+	}
+	draw := jm.drawAttempt(testCID(t), exclude)
+	if len(draw) != need {
+		t.Fatalf("draw under a full exclusion has %d relays, want %d (the independent draw ignores exclude)", len(draw), need)
+	}
+	assertIndependentDrawLegal(t, draw, k, m)
+}
+
+// the scripted rand seam pins two properties the probabilistic tests are
+// nearly blind to: every slot pick spans the full live snapshot (an
+// off-by-one bound would silently skew the arm's statistics), and a
+// duplicate proxy pick is discarded, pairwise across k = 3 branches. The
+// script collides the first two proxy picks on index 0; without the
+// dedup, branches 0 and 1 would share live[0]. The cycling tail keeps
+// rejection redraws terminating
+func TestIndependentDrawUsesFullRangeAndDiscardsDuplicateProxyPicks(t *testing.T) {
+	k, m := 3, 1
+	need := jobSampleSize(k, m)
+	poolSize := 20
+	jm, _ := newTestJobManager(t, &fakeSender{}, poolSize, JobConfig{Branches: k, ReturnPaths: m, Draw: DrawIndependent})
+
+	var bounds []int
+	script := []int{0, 0, 1, 2}
+	calls := 0
+	jm.rand = func(n int) int {
+		bounds = append(bounds, n)
+		defer func() { calls++ }()
+		if calls < len(script) {
+			return script[calls] % n
+		}
+		return calls % n
+	}
+
+	draw := jm.drawAttempt(testCID(t), nil)
+	if len(draw) != need {
+		t.Fatalf("draw has %d relays, want %d", len(draw), need)
+	}
+	assertIndependentDrawLegal(t, draw, k, m)
+	for i, n := range bounds {
+		if n != poolSize {
+			t.Fatalf("pick %d asked jm.rand for a bound of %d, want the full snapshot %d", i, n, poolSize)
+		}
+	}
+}
+
+// mirrors TestRetransmitPoolTooSmallSettlesShortfall on the independent
+// arm: churn runs expire records between the attempts, and the shortfall
+// must settle the job the same way (there is no exclusion fallback whose
+// skip could be miswired)
+func TestIndependentRetransmitPoolTooSmallSettlesShortfall(t *testing.T) {
+	sender := &fakeSender{}
+	k, m := 1, ReturnPathsPerJob
+	jm, surbs := newTestJobManager(t, sender, jobSampleSize(k, m), JobConfig{Branches: k, Timeout: 150 * time.Millisecond, Draw: DrawIndependent})
+
+	res, err := jm.StartJob(context.Background(), testCID(t))
+	if err != nil {
+		t.Fatalf("StartJob: %v", err)
+	}
+	expirePool(jm.pool)
+
+	waitFor(t, 5*time.Second, "the failed retransmit", func() bool { return jm.Metrics().RetransmitsFailed == 1 })
+	select {
+	case got, ok := <-res:
+		if !ok || !errors.Is(got.Err, ErrPoolTooSmall) {
+			t.Fatalf("job settled with ok=%v err=%v, want ErrPoolTooSmall", ok, got.Err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("job never settled on the shortfall")
+	}
+	if surbs.Len() != 0 {
+		t.Errorf("surb store holds %d entries after settle", surbs.Len())
+	}
+}
+
+// the independent draw may hand buildBranches a forward path whose first
+// relay is the branch proxy, the only within-path repeat its rules allow;
+// the packet construction must accept it. Pinned deterministically because
+// the probabilistic tests reach this shape only occasionally
+func TestBuildBranchesAcceptsForwardProxyRepeat(t *testing.T) {
+	k, m := 1, 1
+	need := jobSampleSize(k, m)
+	jm, _ := newTestJobManager(t, &fakeSender{}, need, JobConfig{Branches: k, ReturnPaths: m, Draw: DrawIndependent})
+
+	draw := jm.pool.Sample(need)
+	if len(draw) != need {
+		t.Fatalf("pool sample has %d relays, want %d", len(draw), need)
+	}
+	draw[0] = draw[NrHops-1]
+	branches, err := jm.buildBranches(testCID(t), draw)
+	if err != nil {
+		t.Fatalf("buildBranches rejected the repeated relay: %v", err)
+	}
+	if len(branches) != 1 || len(branches[0].pkt) != Geometry().PacketLength {
+		t.Fatalf("built %d branches with a %d-byte packet, want 1 branch of %d bytes", len(branches), len(branches[0].pkt), Geometry().PacketLength)
+	}
+	if branches[0].firstHop != draw[NrHops-1].PeerID {
+		t.Errorf("first hop %s, want the proxy peer %s", branches[0].firstHop, draw[NrHops-1].PeerID)
 	}
 }
 
