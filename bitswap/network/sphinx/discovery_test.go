@@ -2241,8 +2241,63 @@ func TestNewJobManagerRejectsUnknownDrawPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewKeyManager: %v", err)
 	}
-	if _, err := NewJobManager(&fakeSender{}, km, NewKeyStore(), NewSURBStore(), JobConfig{Draw: DrawPolicy(3)}); err == nil {
+	if _, err := NewJobManager(&fakeSender{}, km, NewKeyStore(), NewSURBStore(), JobConfig{Draw: DrawPolicy(7)}); err == nil {
 		t.Fatal("NewJobManager accepted an unknown draw policy")
+	}
+	for _, p := range []DrawPolicy{DrawExclusive, DrawPerAttempt, DrawIndependent} {
+		if _, err := NewJobManager(&fakeSender{}, km, NewKeyStore(), NewSURBStore(), JobConfig{Draw: p}); err != nil {
+			t.Errorf("NewJobManager rejected draw policy %d: %v", p, err)
+		}
+	}
+}
+
+// DrawPerAttempt keeps the exclusive draw inside one attempt: the sample
+// still consumes a pool of exactly the demand pairwise distinct, and the
+// edge bias stays legal because no slot can repeat
+func TestPerAttemptDrawKeepsAttemptDisjoint(t *testing.T) {
+	k, m := 2, ReturnPathsPerJob
+	need := jobSampleSize(k, m)
+	jm, _ := newTestJobManager(t, &fakeSender{}, need, JobConfig{Branches: k, Draw: DrawPerAttempt})
+
+	draw := jm.drawAttempt(testCID(t), nil)
+	if len(draw) != need {
+		t.Fatalf("draw has %d relays, want %d", len(draw), need)
+	}
+	assertDrawDistinct(t, draw)
+
+	idPriv, _ := newIdentity(t)
+	km, err := NewKeyManager(idPriv, time.Hour)
+	if err != nil {
+		t.Fatalf("NewKeyManager: %v", err)
+	}
+	state := mapPeerState{conn: map[peer.ID]network.Connectedness{}}
+	if _, err := NewJobManager(&fakeSender{}, km, NewKeyStore(), NewSURBStore(),
+		JobConfig{Draw: DrawPerAttempt, InitiatorEdgeEpsilon: 0.5, PeerState: state}); err != nil {
+		t.Errorf("NewJobManager rejected the edge bias on the per-attempt draw: %v", err)
+	}
+}
+
+// the point of DrawPerAttempt: the retransmit draws a fresh disjoint
+// sample without excluding the first attempt, so the two attempts overlap.
+// Pool of exactly 2·need makes the contrast deterministic: the exclusive
+// policy is forced to the disjoint 2·need ledger (see
+// TestRetransmitPrefersFreshRelays), while an unexcluded second draw of 18
+// from 36 avoids all 18 predecessors only with probability 1/C(36,18)
+func TestPerAttemptRetransmitOverlapsFirstAttempt(t *testing.T) {
+	sender := &fakeSender{}
+	k, m := 2, ReturnPathsPerJob
+	need := jobSampleSize(k, m)
+	jm, _ := newTestJobManager(t, sender, 2*need, JobConfig{Branches: k, Timeout: 300 * time.Millisecond, Draw: DrawPerAttempt})
+
+	if _, err := jm.StartJob(context.Background(), testCID(t)); err != nil {
+		t.Fatalf("StartJob: %v", err)
+	}
+	waitFor(t, 5*time.Second, "the retransmit wave", func() bool { return jm.Metrics().Retransmits == 1 })
+	if met := jm.Metrics(); met.RetransmitsFailed != 0 {
+		t.Errorf("retransmit failed %d times, want 0", met.RetransmitsFailed)
+	}
+	if relays := jm.pendingJobRelays(t); len(relays) == 2*need {
+		t.Errorf("the two attempts drew %d pairwise-distinct relays; the per-attempt redraw should not exclude the first attempt", len(relays))
 	}
 }
 

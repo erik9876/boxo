@@ -63,6 +63,13 @@ const (
 	// all relays of an attempt pairwise distinct, and the retransmit
 	// excludes the first attempt's relays where the pool allows it
 	DrawExclusive DrawPolicy = iota
+	// DrawPerAttempt keeps the exclusive sample inside one attempt but
+	// draws each attempt on its own: the retransmit takes a fresh
+	// without-replacement sample and does not exclude the first attempt,
+	// so the two attempts may overlap. It drops the only part of the
+	// policy a relay can reason about across waves ("this job will not
+	// draw me again") while keeping every path invariant. Evaluation arm
+	DrawPerAttempt
 	// DrawIndependent draws every relay slot as an independent uniform
 	// pick with replacement. Only two rules survive: the k proxies stay
 	// pairwise distinct, and no drawn node is asked to dial itself. The
@@ -163,9 +170,9 @@ type discoveryJob struct {
 	// 1 until the retransmit commits, then 2; guarded by mu
 	attempt int
 	// every relay drawn for this job, excluded by the exclusive policy's
-	// retransmit draw (the independent draw ignores the ledger; as a set
-	// it also collapses its repeats). Written under mu at registration;
-	// the retransmit callback is the only later writer
+	// retransmit draw (the other two policies ignore the ledger; as a set
+	// it also collapses the independent draw's repeats). Written under mu
+	// at registration; the retransmit callback is the only later writer
 	relays map[peer.ID]struct{}
 	// the branch proxies of every attempt of this job; mergeAnswers sorts
 	// them to the end of the provider list
@@ -230,8 +237,8 @@ func NewJobManager(sender PacketSender, km *KeyManager, pool *KeyStore, surbs *S
 	if cfg.InitiatorEdgeEpsilon > 1 {
 		return nil, errors.New("initiator edge epsilon must be at most 1 (negative disables the bias)")
 	}
-	if cfg.Draw != DrawExclusive && cfg.Draw != DrawIndependent {
-		return nil, errors.New("draw policy must be DrawExclusive or DrawIndependent")
+	if cfg.Draw != DrawExclusive && cfg.Draw != DrawPerAttempt && cfg.Draw != DrawIndependent {
+		return nil, errors.New("draw policy must be DrawExclusive, DrawPerAttempt or DrawIndependent")
 	}
 	if cfg.Draw == DrawIndependent && cfg.PeerState != nil && cfg.InitiatorEdgeEpsilon >= 0 {
 		return nil, errors.New("initiator edge bias cannot run on the independent draw: its permutation could join repeated peers into adjacent slots (set the epsilon negative)")
@@ -1127,8 +1134,10 @@ func (jm *JobManager) onTimer(jobID uint64, gen uint64) {
 func (jm *JobManager) retransmit(j *discoveryJob) {
 	need := jm.sampleSize()
 	// only the exclusive draw avoids the first attempt's relays, with the
-	// unrestricted fallback when the exclusion would starve the pool; the
-	// independent policy redraws uniformly and needs neither
+	// unrestricted fallback when the exclusion would starve the pool. The
+	// other two policies redraw without it and need no fallback:
+	// DrawPerAttempt takes a fresh exclusive sample, DrawIndependent
+	// repeats its per-slot draw
 	var exclude map[peer.ID]struct{}
 	if jm.draw == DrawExclusive {
 		exclude = j.relays
