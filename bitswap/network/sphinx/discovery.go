@@ -332,17 +332,16 @@ func (jm *JobManager) StartJob(ctx context.Context, c cid.Cid) (<-chan JobResult
 
 	jm.observeAttempt(j.id, c, 1, draw)
 	jm.metrics.JobsStarted.Add(1)
-	sent := 0
-	var dead []int
-	for bi, b := range branches {
-		if jm.sendBranch(ctx, b) {
-			sent++
-		} else {
-			dead = append(dead, bi)
-		}
-	}
+	dead := jm.sendBranches(ctx, branches)
 	for _, bi := range dead {
 		jm.observeBranch(j.id, 1, bi, BranchDeadSend)
+	}
+	// a caller gone before any packet left cancelled these sends itself:
+	// the job dies with it instead of retrying, at the send bound or at
+	// the attempt timer, for a request nobody waits on anymore
+	if ctx.Err() != nil && len(dead) == len(branches) {
+		jm.abandon(j, ctx.Err())
+		return nil, ctx.Err()
 	}
 	// dead branches leave the quorum; a first attempt with every branch
 	// dead retries through the same path as one whose branches all
@@ -351,6 +350,19 @@ func (jm *JobManager) StartJob(ctx context.Context, c cid.Cid) (<-chan JobResult
 		jm.markBranchesDead(j, len(dead))
 	}
 	return j.result, nil
+}
+
+// abandon settles a job whose caller is gone: it never becomes a
+// retransmit and its timer never fires
+func (jm *JobManager) abandon(j *discoveryJob, err error) {
+	jm.mu.Lock()
+	if _, ok := jm.jobs[j.id]; !ok {
+		jm.mu.Unlock()
+		return
+	}
+	jm.unregisterLocked(j)
+	jm.mu.Unlock()
+	jm.settleQuorum(j, JobResult{Err: err})
 }
 
 // markBranchesDead removes n branches from the quorum: their packets never
@@ -846,6 +858,41 @@ func (jm *JobManager) recordProxyCPLs(c cid.Cid, draw []KeyInfo) {
 	}
 }
 
+// sendTimeout bounds one branch send: a send blocking in its dial past the
+// attempt timer books its dead branch only after the attempt is over. A
+// third of the timer leaves the rest for the reply and keeps the
+// deployment default at one transport send
+func (jm *JobManager) sendTimeout() time.Duration {
+	return min(jm.timeout/3, relayTimeout)
+}
+
+// sendBranches dispatches an attempt's branches at once and returns the
+// indices that died at send, in branch order. One goroutine per branch,
+// each under its own bound: in sequence a branch blocking in its dial
+// spends the attempt timer of the branches behind it, and under a shared
+// bound a branch scheduled late sends into an already spent one. The
+// counters sendBranch touches are atomics
+func (jm *JobManager) sendBranches(ctx context.Context, branches []branch) []int {
+	failed := make([]bool, len(branches))
+	var wg sync.WaitGroup
+	for bi, b := range branches {
+		wg.Go(func() {
+			sctx, cancel := context.WithTimeout(ctx, jm.sendTimeout())
+			defer cancel()
+			failed[bi] = !jm.sendBranch(sctx, b)
+		})
+	}
+	wg.Wait()
+
+	var dead []int
+	for bi, f := range failed {
+		if f {
+			dead = append(dead, bi)
+		}
+	}
+	return dead
+}
+
 // a failed send only kills the branch
 func (jm *JobManager) sendBranch(ctx context.Context, b branch) bool {
 	if err := jm.sender.SendPacket(ctx, b.firstHop, b.pkt); err != nil {
@@ -1179,17 +1226,7 @@ func (jm *JobManager) retransmit(j *discoveryJob) {
 
 	// the StartJob ctx bounded only the first attempt; even if every send
 	// fails, the final timer settles the job
-	sent := 0
-	var dead []int
-	for bi, b := range branches {
-		sctx, cancel := context.WithTimeout(context.Background(), relayTimeout)
-		if jm.sendBranch(sctx, b) {
-			sent++
-		} else {
-			dead = append(dead, bi)
-		}
-		cancel()
-	}
+	dead := jm.sendBranches(context.Background(), branches)
 	for _, bi := range dead {
 		jm.observeBranch(j.id, 2, bi, BranchDeadSend)
 	}

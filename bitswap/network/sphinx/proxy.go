@@ -149,19 +149,35 @@ func (p *Proxy) runJob(job *Job) {
 
 	// identical reply through every SURB; the initiator dedups by SURB ID.
 	// A failed send is a benign drop (that is what the m return paths pay
-	// for). Own deadline so the discovery timeout cannot cut off the send
+	// for), waiting for one is not: a return path hanging in its dial would
+	// hold back the copies behind it past the initiator's timer, so the
+	// copies go out at once, each under its own bound
+	var wg sync.WaitGroup
 	for i, surb := range job.SURBs {
 		pkt, first, err := NewReplyFromSURB(surb, reply)
 		if err != nil {
 			log.Debugw("skipping unusable surb", "cid", job.CID, "surb", i, "error", err)
 			continue
 		}
-		sctx, scancel := context.WithTimeout(context.Background(), relayTimeout)
-		if err := p.sender.SendPacket(sctx, first, pkt); err != nil {
-			log.Debugw("discovery reply dropped", "cid", job.CID, "surb", i, "error", err)
-		}
-		scancel()
+		wg.Go(func() {
+			sctx, scancel := context.WithTimeout(context.Background(), p.sendTimeout())
+			defer scancel()
+			if err := p.sender.SendPacket(sctx, first, pkt); err != nil {
+				log.Debugw("discovery reply dropped", "cid", job.CID, "surb", i, "error", err)
+			}
+		})
 	}
+	// the job keeps its admit slot until the last copy is out or bounded
+	// out; the concurrency cap counts jobs still on the wire
+	wg.Wait()
+}
+
+// sendTimeout bounds one reply copy. Its own deadline, not the discovery
+// context: a discovery that ran into the proxy timeout must not cut off
+// the reply it produced. So a job holds its admit slot for the discovery
+// plus one send, never longer than one transport send per copy
+func (p *Proxy) sendTimeout() time.Duration {
+	return min(p.timeout, relayTimeout)
 }
 
 func (p *Proxy) admit() bool {

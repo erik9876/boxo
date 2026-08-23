@@ -125,16 +125,76 @@ func TestProxyRepliesThroughAllSURBs(t *testing.T) {
 	p.HandleDelivery(DiscoveryRecipient, payload)
 	waitFor(t, 5*time.Second, "all replies", func() bool { return len(sender.snapshot()) == ReturnPathsPerJob })
 
+	// the copies go out in parallel, so they are a set of first return
+	// hops, not a sequence
+	want := make(map[peer.ID]bool, len(firstHops))
+	for _, hop := range firstHops {
+		want[hop] = true
+	}
 	packetLen := Geometry().PacketLength
 	for i, s := range sender.snapshot() {
 		if len(s.pkt) != packetLen {
 			t.Errorf("reply %d is %d bytes, want %d", i, len(s.pkt), packetLen)
 		}
-		if s.to != firstHops[i] {
-			t.Errorf("reply %d sent to %s, want first return hop %s", i, s.to, firstHops[i])
+		if !want[s.to] {
+			t.Errorf("reply %d sent to %s, want one of the first return hops", i, s.to)
 		}
+		delete(want, s.to)
+	}
+	if len(want) != 0 {
+		t.Errorf("%d return paths never got a reply copy", len(want))
 	}
 	waitFor(t, 2*time.Second, "job state to die", func() bool { return p.runningJobs() == 0 })
+}
+
+// one hung return path must not delay the other copies: they are what the
+// m return paths pay for, and the initiator's timer runs while the proxy
+// waits
+func TestProxyReplyCopiesDispatchInParallel(t *testing.T) {
+	sender := &blockingSender{blockFirst: 1}
+	m := ReturnPathsPerJob
+	timeout := 500 * time.Millisecond
+	p := newTestProxy(t, sender, ProxyConfig{
+		Discoverer: &fakeDiscoverer{providers: testProviders(t, 1)},
+		Timeout:    timeout,
+	})
+	payload, _ := buildTestJob(t, m)
+
+	start := time.Now()
+	p.HandleDelivery(DiscoveryRecipient, payload)
+	waitFor(t, 2*time.Second, "the copies past the hung return path", func() bool {
+		return len(sender.snapshot()) == m-1
+	})
+	if starts := sender.startTimes(); len(starts) != m {
+		t.Fatalf("proxy started %d sends, want m = %d", len(starts), m)
+	} else if got := spread(starts); got > 200*time.Millisecond {
+		t.Errorf("reply copies started %v apart, want them dispatched together", got)
+	}
+
+	// the job holds its slot until the last copy is out or bounded out;
+	// dispatched together that is one bound for the wave, not m of them
+	waitFor(t, 5*time.Second, "job state to die", func() bool { return p.runningJobs() == 0 })
+	if elapsed := time.Since(start); elapsed >= 2*timeout {
+		t.Errorf("the reply wave took %v, want it bounded by the %v proxy timeout", elapsed, timeout)
+	}
+}
+
+// the reply bound is derived, never configured: the proxy's own timeout,
+// and never longer than one transport send
+func TestProxySendTimeoutClampedToTransportSend(t *testing.T) {
+	for _, tc := range []struct {
+		timeout time.Duration
+		want    time.Duration
+	}{
+		{timeout: 2 * time.Second, want: 2 * time.Second},
+		{timeout: DefaultProxyTimeout, want: relayTimeout},
+		{timeout: time.Minute, want: relayTimeout},
+	} {
+		p := newTestProxy(t, &fakeSender{}, ProxyConfig{Discoverer: &fakeDiscoverer{}, Timeout: tc.timeout})
+		if got := p.sendTimeout(); got != tc.want {
+			t.Errorf("sendTimeout at a %v proxy timeout = %v, want %v", tc.timeout, got, tc.want)
+		}
+	}
 }
 
 func TestProxyEmptyProviderListStillReplies(t *testing.T) {

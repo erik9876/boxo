@@ -127,18 +127,24 @@ func TestObserverSeesAttemptPaths(t *testing.T) {
 		t.Errorf("attempt uses %d distinct peers, want %d", len(seen), jobSampleSize(k, m))
 	}
 
-	// pins export-vs-wire identity: the exported forward path's first slot
-	// must name the same peer the packet for that branch actually went to.
-	// The sends happen in branch order right after OnAttempt, so snapshot
-	// order matches path order
+	// pins export-vs-wire identity: every exported forward path's first
+	// slot must name a peer a packet actually went to, one per branch. The
+	// branches are dispatched together, so snapshot order says nothing
+	// about branch order
 	sent := sender.snapshot()
 	if len(sent) != k {
 		t.Fatalf("sender recorded %d packets, want k = %d", len(sent), k)
 	}
+	wire := make(map[peer.ID]bool, k)
+	for _, s := range sent {
+		wire[s.to] = true
+	}
 	for bi := range a.paths {
-		if a.paths[bi].Forward[0] != sent[bi].to {
-			t.Errorf("branch %d: exported first hop %s != wire recipient %s", bi, a.paths[bi].Forward[0], sent[bi].to)
+		first := a.paths[bi].Forward[0]
+		if !wire[first] {
+			t.Errorf("branch %d: exported first hop %s got no packet", bi, first)
 		}
+		delete(wire, first)
 	}
 }
 
@@ -241,8 +247,18 @@ func TestObserverBranchDeadSend(t *testing.T) {
 			dead = append(dead, o)
 		}
 	}
-	if len(dead) != 1 || dead[0].branch != 0 || dead[0].attempt != 1 {
-		t.Fatalf("dead-send outcomes = %v, want exactly branch 0 of attempt 1", dead)
+	if len(dead) != 1 || dead[0].attempt != 1 {
+		t.Fatalf("dead-send outcomes = %v, want exactly one on attempt 1", dead)
+	}
+	// the branches are dispatched together, so which one the sender fails
+	// is not fixed; the wire says which branch died
+	sent := sender.snapshot()
+	if len(sent) != 1 {
+		t.Fatalf("sender recorded %d packets, want the single live branch", len(sent))
+	}
+	paths := obs.snapshotAttempts()[0].paths
+	if first := paths[dead[0].branch].Forward[0]; first == sent[0].to {
+		t.Errorf("dead send names branch %d, whose packet reached %s", dead[0].branch, first)
 	}
 }
 

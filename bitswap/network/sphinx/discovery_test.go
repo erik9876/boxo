@@ -138,6 +138,172 @@ func (s *flakySender) SendPacket(ctx context.Context, next peer.ID, pkt []byte) 
 	return s.fakeSender.SendPacket(ctx, next, pkt)
 }
 
+// blockingSender blocks the first blockFirst sends until their context
+// ends and captures the rest; every call records when it started. Stands
+// in for a first hop whose dial hangs until the send deadline
+type blockingSender struct {
+	fakeSender
+	blockMu    sync.Mutex
+	blockFirst int
+	calls      int
+	starts     []time.Time
+}
+
+func (s *blockingSender) SendPacket(ctx context.Context, next peer.ID, pkt []byte) error {
+	s.blockMu.Lock()
+	s.calls++
+	block := s.calls <= s.blockFirst
+	s.starts = append(s.starts, time.Now())
+	s.blockMu.Unlock()
+	if block {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return s.fakeSender.SendPacket(ctx, next, pkt)
+}
+
+func (s *blockingSender) startTimes() []time.Time {
+	s.blockMu.Lock()
+	defer s.blockMu.Unlock()
+	return append([]time.Time(nil), s.starts...)
+}
+
+// spread is the window every send of one wave started in
+func spread(starts []time.Time) time.Duration {
+	first, last := starts[0], starts[0]
+	for _, at := range starts {
+		if at.Before(first) {
+			first = at
+		}
+		if at.After(last) {
+			last = at
+		}
+	}
+	return last.Sub(first)
+}
+
+// a branch whose first hop hangs must not hold back the other branches:
+// they are the redundancy the job pays k for, and a serialized dispatch
+// spends the attempt timer on a single dead dial
+func TestBranchSendsDispatchInParallel(t *testing.T) {
+	sender := &blockingSender{blockFirst: 1}
+	k, m := 2, ReturnPathsPerJob
+	jm, _ := newTestJobManager(t, sender, jobSampleSize(k, m), JobConfig{Branches: k, ReturnPaths: m, Timeout: 3 * time.Second})
+
+	// the caller context only keeps a regression from hanging the suite;
+	// the send bound the manager derives is far below it
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	if _, err := jm.StartJob(ctx, testCID(t)); err != nil {
+		t.Fatalf("StartJob: %v", err)
+	}
+
+	starts := sender.startTimes()
+	if len(starts) != k {
+		t.Fatalf("StartJob started %d sends, want k = %d", len(starts), k)
+	}
+	if got := spread(starts); got > 200*time.Millisecond {
+		t.Errorf("branch sends started %v apart, want them dispatched together", got)
+	}
+	if got := len(sender.snapshot()); got != k-1 {
+		t.Errorf("%d branch packets went out, want %d (one first hop hangs)", got, k-1)
+	}
+}
+
+// a send that outlives the attempt timer can only report its dead branch
+// after the attempt is over; the bound is derived from the timer, so the
+// dead branch is booked while the attempt still runs
+func TestBranchSendBoundedBelowAttemptTimer(t *testing.T) {
+	sender := &blockingSender{blockFirst: 2}
+	obs := &recordingObserver{}
+	k, m := 2, 1
+	need := jobSampleSize(k, m)
+	timeout := 3 * time.Second
+	jm, _ := newTestJobManager(t, sender, 2*need,
+		JobConfig{Branches: k, ReturnPaths: m, Timeout: timeout, Observer: obs})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	start := time.Now()
+	if _, err := jm.StartJob(ctx, testCID(t)); err != nil {
+		t.Fatalf("StartJob: %v", err)
+	}
+	// the sends run at once, each under the bound, so the whole wave dies
+	// within one of them
+	if elapsed := time.Since(start); elapsed > jm.sendTimeout()*3/2 {
+		t.Errorf("the hung branch wave took %v, want it bounded by %v", elapsed, jm.sendTimeout())
+	}
+	if got := jm.Metrics().SendFailures; got != uint64(k) {
+		t.Errorf("SendFailures = %d, want %d", got, k)
+	}
+	dead := 0
+	for _, o := range obs.snapshotOutcomes() {
+		if o.attempt == 1 && o.outcome == BranchDeadSend {
+			dead++
+		}
+	}
+	if dead != k {
+		t.Errorf("observer saw %d dead sends on attempt 1, want %d", dead, k)
+	}
+
+	// every branch dead is the fast-fail path: the retry runs off the send
+	// bound, not off the attempt timer
+	waitFor(t, 5*time.Second, "the early retransmit wave", func() bool { return len(sender.snapshot()) == k })
+	if elapsed := time.Since(start); elapsed >= timeout {
+		t.Errorf("the retransmit fired after %v, want it before the %v attempt timer", elapsed, timeout)
+	}
+}
+
+// a caller that goes away while its sends block cancels them itself; that
+// is no reason to put a second wave on the wire for it
+func TestCallerCancelDuringSendsSkipsRetransmit(t *testing.T) {
+	sender := &blockingSender{blockFirst: 2}
+	k, m := 2, 1
+	need := jobSampleSize(k, m)
+	jm, _ := newTestJobManager(t, sender, 2*need,
+		JobConfig{Branches: k, ReturnPaths: m, Timeout: 3 * time.Second})
+
+	// well below the derived send bound: the sends end on the caller, not
+	// on their own deadline
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	res, err := jm.StartJob(ctx, testCID(t))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("StartJob returned %v, want the caller's context error", err)
+	}
+	if res != nil {
+		t.Error("StartJob returned a result channel for a job it abandoned")
+	}
+
+	// past the attempt timer: neither the send bound nor the timer may
+	// commit a retransmit
+	time.Sleep(jm.timeout + 500*time.Millisecond)
+	if got := len(sender.snapshot()); got != 0 {
+		t.Errorf("%d packets went out after the caller was gone, want none", got)
+	}
+	if got := jm.Metrics().Retransmits; got != 0 {
+		t.Errorf("Retransmits = %d, want 0", got)
+	}
+}
+
+// sendTimeout is derived, never configured: a third of the attempt timer,
+// and never longer than one transport send
+func TestSendTimeoutDerivesFromAttemptTimer(t *testing.T) {
+	for _, tc := range []struct {
+		timeout time.Duration
+		want    time.Duration
+	}{
+		{timeout: 6 * time.Second, want: 2 * time.Second},
+		{timeout: DefaultJobTimeout, want: relayTimeout},
+		{timeout: 5 * time.Minute, want: relayTimeout},
+	} {
+		jm, _ := newTestJobManager(t, &fakeSender{}, 0, JobConfig{Timeout: tc.timeout})
+		if got := jm.sendTimeout(); got != tc.want {
+			t.Errorf("sendTimeout at a %v attempt timer = %v, want %v", tc.timeout, got, tc.want)
+		}
+	}
+}
+
 func TestStartJobSendsForwardPacket(t *testing.T) {
 	sender := &fakeSender{}
 	m := ReturnPathsPerJob
