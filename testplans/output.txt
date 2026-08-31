@@ -1,0 +1,123 @@
+loaded 150 runs
+
+1. Latency, fix series, successful jobs, ms
+f = 0
+            cell    n  first p50  first p90  settled p50  settled p90  dht record p50
+-------------------------------------------------------------------------------------
+   vanilla probe  100        328        391            -            -               -
+vanilla fallback  100       1627       1647            -            -            1204
+    sphinx probe  100       1624       1650         1641         1709               -
+ sphinx fallback  100       2246       2268         2261         2391               -
+
+fallback tunnel: delta +619 ms, model 600 ms (6 hops x 100 ms), residual +19 ms
+probe decomposition: 1624 - 1000 probe window - 600 tunnel = +24 ms residual
+arrival spread within attempt 1, branch 2 minus branch 1, p25 / p50 / p75 ms: sphinx probe -13 / -1 / 15 (n=100), sphinx fallback -14 / -1 / 11 (n=100)
+
+f = 12, vanilla. First is censored at the walk cut for the fallback, hence the dht record.
+            cell      metric    n   p50   p90
+---------------------------------------------
+   vanilla probe       first  100   309   340
+vanilla fallback  dht record  100  1208  1231
+
+f = 12, sphinx, first_ms split by the attempt that delivered
+           cell  success  n att1  p50 att1  n att2  p50 att2  att2 - att1
+-------------------------------------------------------------------------
+   sphinx probe   92/100      67      1638      25      7650        +6013
+sphinx fallback   91/100      65      3629      26      9631        +6002
+
+2. Measurement against the path-geometry model, sphinx-hit, exclusive draw, fix series. 100 jobs and 200 attempt-1 branches per f.
+ f      p  branch ok %  model         95% CI  model in CI
+---------------------------------------------------------
+ 0  0.000        100.0  100.0  [98.1, 100.0]          yes
+ 2  0.041         85.0   88.0   [79.4, 89.3]          yes
+ 5  0.102         72.0   71.5   [65.4, 77.8]          yes
+ 8  0.163         57.0   56.4   [50.1, 63.7]          yes
+12  0.245         43.0   38.7   [36.3, 49.9]          yes
+16  0.327         17.0   24.3   [12.4, 22.8]           NO
+20  0.408         11.5   13.7    [7.8, 16.7]          yes
+24  0.490          8.0    6.8    [5.0, 12.6]          yes
+
+ f      p  att1 %  model         95% CI  model in CI
+----------------------------------------------------
+ 0  0.000   100.0  100.0  [96.3, 100.0]          yes
+ 2  0.041    99.0   99.2   [94.6, 99.8]          yes
+ 5  0.102    93.0   93.2   [86.3, 96.6]          yes
+ 8  0.163    82.0   82.6   [73.3, 88.3]          yes
+12  0.245    67.0   63.9   [57.3, 75.4]          yes
+16  0.327    34.0   43.8   [25.5, 43.7]           NO
+20  0.408    23.0   26.1   [15.8, 32.2]          yes
+24  0.490    16.0   13.3   [10.1, 24.4]          yes
+
+ f      p  job %  model         95% CI  model in CI
+---------------------------------------------------
+ 0  0.000  100.0  100.0  [96.3, 100.0]          yes
+ 2  0.041  100.0  100.0  [96.3, 100.0]          yes
+ 5  0.102  100.0   99.8  [96.3, 100.0]          yes
+ 8  0.163   97.0   98.0   [91.5, 99.0]          yes
+12  0.245   92.0   89.3   [85.0, 95.9]          yes
+16  0.327   63.0   71.0   [53.2, 71.8]          yes
+20  0.408   40.0   47.1   [30.9, 49.8]          yes
+24  0.490   29.0   25.5   [21.0, 38.5]          yes
+
+3. What the redundancy buys, sphinx-hit, exclusive draw, fix series. Lift is job minus attempt 1, which is also the share of all jobs the retry saved.
+ f  branch ok %  att1 %  job %  lift pp  att2 ok/started  rescue %
+------------------------------------------------------------------
+ 0        100.0   100.0  100.0     +0.0              0/0         -
+ 2         85.0    99.0  100.0     +1.0              1/1     100.0
+ 5         72.0    93.0  100.0     +7.0              7/7     100.0
+ 8         57.0    82.0   97.0    +15.0            15/18      83.3
+12         43.0    67.0   92.0    +25.0            25/33      75.8
+16         17.0    34.0   63.0    +29.0            29/66      43.9
+20         11.5    23.0   40.0    +17.0            17/77      22.1
+24          8.0    16.0   29.0    +13.0            13/84      15.5
+
+branch success crosses 99 % at f=0.13 (p=0.003), 90 % at f=1.33 (p=0.027), 50 % at f=10.00 (p=0.204)
+attempt 1 success crosses 99 % at f=2.00 (p=0.041), 90 % at f=5.82 (p=0.119), 50 % at f=14.06 (p=0.287)
+job success crosses 99 % at f=6.00 (p=0.122), 90 % at f=12.28 (p=0.251), 50 % at f=18.26 (p=0.373)
+
+4. Mechanism check, sphinx-hit, exclusive draw, fix series, all attempts
+structurally intact branches: 917, of them delivered: 917
+structurally dead branches: 1255, of them delivered: 0
+intact yet dead, over all dead branches: 0/1255 (0.0 %)
+delivered with a dead relay on the forward path: 0
+delivered with all three return paths dead: 0
+
+death site  branches  share %  model %
+--------------------------------------
+        R1       549     43.7     45.3
+        R2       374     29.8     29.3
+     proxy       261     20.8     19.5
+    return        71      5.7      5.9
+    intact         0      0.0      0.0
+
+5. Draw policy, sphinx-hit in the fix series. Success pools f >= 8, the draw shape columns use every f.
+        arm  jobs  job %  att2 ok/started  distinct of 18  att1/att2 overlap  repeat peer in branch     %
+---------------------------------------------------------------------------------------------------------
+  exclusive   500   64.2           99/278          18.000               0.00                 0/2172   0.0
+per-attempt   500   67.2           85/249          18.000               6.54                 0/2106   0.0
+independent   500   66.6          107/274          15.431               4.77              1012/2172  46.6
+
+       paired by f and seed  n pairs  mean diff pp       95% CI pp
+------------------------------------------------------------------
+per-attempt minus exclusive       25         +3.00  [-3.19, +9.19]
+independent minus exclusive       25         +2.40  [-3.65, +8.45]
+
+6. Bytes per job during the job loop, fix series, mean over the five seeds. Killed nodes report nothing, so f=12 sums 38 nodes.
+ f  target     mode  runs  relay out  initiator in+out  network in+out
+----------------------------------------------------------------------
+ 0     hit  vanilla     5          0             12865           25730
+ 0     hit   sphinx     5      58392             20312          173616
+ 0   nohit  vanilla     5          0             55533          111065
+ 0   nohit   sphinx     5      58392             22581          341476
+12     hit  vanilla     5          0              9745           19490
+12     hit   sphinx     5      28028             27541          245740
+12   nohit  vanilla     5          0             39385           78769
+12   nohit   sphinx     5      28417             30148          313762
+
+ f  target  initiator sphinx/vanilla  network sphinx/vanilla
+------------------------------------------------------------
+ 0     hit                      1.58                    6.75
+ 0   nohit                      0.41                    3.07
+12     hit                      2.83                   12.61
+12   nohit                      0.77                    3.98
+

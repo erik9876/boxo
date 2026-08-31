@@ -1,0 +1,49 @@
+# Testground plan manifest for the Hidden Path evaluation harness.
+#
+# Shaped runs need docker:go + local:docker (only the sidecar applies link
+# shaping); exec:go + local:exec is enabled for unshaped local smoke tests.
+
+name = "hiddenpath"
+
+[defaults]
+builder = "docker:go"
+runner = "local:docker"
+
+[builders."docker:go"]
+enabled = true
+build_base_image = "golang:1.26-bookworm"
+module_path = "github.com/ipfs/boxo/testplans/hiddenpath"
+exec_pkg = "."
+
+[builders."exec:go"]
+enabled = true
+module_path = "github.com/ipfs/boxo/testplans/hiddenpath"
+
+[runners."local:docker"]
+enabled = true
+
+[runners."local:exec"]
+enabled = true
+
+[[testcases]]
+name = "discovery"
+instances = { min = 5, max = 300, default = 50 }
+
+  [testcases.params]
+  mode = { type = "string", desc = "discovery path of the initiator: vanilla (DHT) or sphinx (proxy jobs)", default = "sphinx" }
+  l = { type = "int", desc = "MinProxyCPL (ℓ), 0..256; sphinx mode only", default = 0 }
+  k = { type = "int", desc = "parallel branches per job; sphinx mode only", default = 2 }
+  m = { type = "int", desc = "SURBs (return paths) per branch; sphinx mode only", default = 3 }
+  f = { type = "int", desc = "number of pool nodes hard-killed before the job loop", default = 0 }
+  timeout_ms = { type = "int", desc = "job attempt timeout T in ms (JobConfig.Timeout; per-job ctx: vanilla T, sphinx 2T+5s)", default = 30000 }
+  proxy_timeout_ms = { type = "int", desc = "proxy-side discovery timeout in ms (ProxyConfig.Timeout); must stay under T minus path RTTs", default = 10000 }
+  retransmit = { type = "bool", desc = "false disables the one-retry retransmit (JobConfig.DisableRetransmit)", default = true }
+  draw_policy = { type = "string", desc = "relay draw policy (JobConfig.Draw): exclusive = one sample without replacement, the retransmit excludes the first attempt's relays; per-attempt = a fresh sample per attempt without that exclusion; independent = every slot an independent pick, only the k proxies stay distinct", default = "exclusive" }
+  provider_blocks = { type = "bool", desc = "provider holds real 4096-B blocks (broadcast-hit cell)", default = false }
+  seed = { type = "int", desc = "run seed: CID derivation, victim selection and bootstrap jitter", default = 1 }
+  mesh_quorum = { type = "float", desc = "fraction of a node's dial targets that must connect for bootstrap to pass", default = 0.9 }
+  jobs = { type = "int", desc = "sequential discovery jobs (= announced CIDs) per run", default = 20 }
+  clients = { type = "int", desc = "DHT-client nodes without key serving (excluded from relay pools): converts the initiator first, then pool nodes from the highest seq down; the provider always stays a server", default = 0 }
+  latency_ms = { type = "int", desc = "link latency applied to every instance", default = 100 }
+  bandwidth = { type = "int", desc = "link bandwidth for the sidecar LinkShape (FPA-compatible value 1048576)", default = 1048576 }
+  edge_epsilon = { type = "float", desc = "initiator-edge connection bias (JobConfig.InitiatorEdgeEpsilon): P(connected) per initiator-adjacent relay slot; 0..1 enables it, negative disables it as in the full-mesh testbed, where an unconnected relay is exactly a victim", default = -1.0 }
