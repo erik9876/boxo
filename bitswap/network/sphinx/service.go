@@ -32,8 +32,7 @@ type ServiceConfig struct {
 	PeerRouting PeerFinder
 	// Mode gates key serving: ModeRelay serves the own key, ModeClient
 	// never does, ModeAuto (zero value) follows the host's mounted kad
-	// server protocol. Serving is the only role-gated piece; relay,
-	// proxy and initiator stay active in every mode
+	// server protocol. Serving gates the whole role set
 	Mode Mode
 	// KadServerProtocols is the exact set ModeAuto matches against the
 	// host's mounted protocols; empty means DefaultKadServerProtocols
@@ -42,8 +41,9 @@ type ServiceConfig struct {
 
 // Service is one full Sphinx node on a libp2p host: key layer, packet
 // core and both job roles behind one constructor with a defined shutdown
-// order. Every node runs relay, proxy and initiator; the relay handler is
-// also how an initiator receives its own SURB replies. No own goroutines
+// order. A serving node runs relay, proxy and initiator at once; the
+// relay handler is also how an initiator receives its own SURB replies.
+// No own goroutines
 type Service struct {
 	km    *KeyManager
 	pool  *KeyStore

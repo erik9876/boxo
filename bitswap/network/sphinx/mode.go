@@ -7,10 +7,9 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 )
 
-// Mode gates whether a node serves its Sphinx key and is therefore
-// eligible as relay/proxy in remote pools. Only DHT servers make useful
-// relays; a client keeps a local key for the SURB terminal hop but never
-// puts it on the wire, because nothing ever needs a client's key remotely
+// Mode gates whether a node serves its Sphinx key and with it the node's
+// whole role set, see ServiceConfig.Mode. Only DHT servers make useful
+// relays; a client still generates a local key
 type Mode int
 
 const (
